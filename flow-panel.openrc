@@ -1,0 +1,11 @@
+#!/sbin/openrc-run
+name="Flow Panel"
+description="LAN download panel"
+command="/usr/local/bin/flow-panel"
+command_args="--host 0.0.0.0 --port 8080"
+command_background="yes"
+pidfile="/run/flow-panel.pid"
+
+depend() {
+    need net
+}

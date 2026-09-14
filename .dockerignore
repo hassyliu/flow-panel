@@ -1,0 +1,10 @@
+.git
+abc
+dist
+work
+*.exe
+*.log
+*.zip
+*.tar.gz
+.env*
+tasks.json
