@@ -1,0 +1,15 @@
+[Unit]
+Description=Flow Panel download manager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/
+ExecStart=/usr/local/bin/flow-panel --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
