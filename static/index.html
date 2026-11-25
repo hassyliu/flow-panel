@@ -1,38 +1,106 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="color-scheme" content="light"><title>Flow Panel · 下载任务</title>
-  <link rel="icon" href="/favicon.svg"><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flow Panel</title>
+  <link rel="icon" href="/favicon.svg">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
 </head>
 <body>
-  <header><a class="brand" href="/">Flow Panel <span>v1.7</span></a><span id="connection" class="connection">正在连接…</span></header>
+  <header>
+    <div class="brand">Flow Panel <span id="version"></span></div>
+    <div class="summary">
+      <span id="connection" class="connection">连接中…</span>
+      <span id="counts" class="muted"></span>
+      <span class="total">总网速 <strong id="total-speed">0 B/s</strong></span>
+    </div>
+  </header>
+
   <main>
-    <div class="heading"><div><h1>下载任务</h1><p>每条任务独立启动、停止。</p></div><div class="total-speed"><span>总下载网速</span><strong id="total-speed">0 B/s</strong></div></div>
-    <section class="task-panel" aria-label="任务列表">
-      <div class="toolbar"><input id="search" type="search" placeholder="搜索任务名称或链接" aria-label="搜索任务"><div class="toolbar-actions"><button id="stop-all" class="secondary" disabled>全部停止</button><button id="add-task" class="primary">＋ 添加任务</button></div></div>
-      <div class="table-scroll"><table><thead><tr><th>任务 / 下载链接</th><th>状态</th><th>并发</th><th>下载模式</th><th>实时网速</th><th class="actions-heading">操作</th></tr></thead><tbody id="task-body"></tbody></table></div>
-      <div id="empty" class="empty"><span class="empty-icon">↓</span><h2>还没有下载任务</h2><p>添加一个链接，或一次粘贴多行批量添加。</p><button id="first-task" class="primary">创建第一条任务</button></div>
-      <div id="no-results" class="no-results" hidden>没有匹配的任务。</div>
-    </section>
-    <p class="footnote">下载内容不保存。添加后自动下载；重启恢复已开启的任务，手动停止的保持停止。</p>
+    <div class="toolbar">
+      <input id="search" type="search" placeholder="搜索名称或链接" aria-label="搜索任务">
+      <div class="actions">
+        <button id="import" type="button">导入</button>
+        <button id="export" type="button">导出</button>
+        <span class="divider"></span>
+        <button id="start-all" type="button">全部开始</button>
+        <button id="stop-all" type="button">全部停止</button>
+        <button id="add-task" type="button" class="primary">添加任务</button>
+      </div>
+    </div>
+
+    <table>
+      <thead>
+        <tr><th>任务</th><th>状态</th><th>并发</th><th>次数</th><th class="num">网速</th><th class="ops">操作</th></tr>
+      </thead>
+      <tbody id="task-body"></tbody>
+    </table>
+    <p id="empty" class="empty" hidden>还没有任务。点击“添加任务”，或导入配置文件。</p>
+    <p id="no-results" class="empty" hidden>没有匹配的任务。</p>
   </main>
+
   <dialog id="task-dialog" aria-labelledby="form-title">
-    <form id="task-form">
-      <div class="dialog-heading"><h2 id="form-title">添加下载任务</h2><button id="close-dialog" class="icon-button" type="button" aria-label="关闭">×</button></div>
+    <form id="task-form" method="dialog">
+      <h2 id="form-title">添加任务</h2>
       <fieldset id="form-fields">
-        <label for="task-urls">下载链接</label><textarea id="task-urls" rows="4" required spellcheck="false" placeholder="https://example.com/file.bin"></textarea>
-        <p id="url-note" class="note">每行一个链接，每条链接创建独立任务。</p>
-        <label for="task-name">任务名称 <span>可留空</span></label><input id="task-name" maxlength="80" placeholder="默认使用文件名">
-        <div class="form-grid"><div><label for="task-concurrency">并发数</label><input id="task-concurrency" type="number" min="1" max="64" value="8" required></div><div><label for="task-repeat">每条下载次数</label><input id="task-repeat" type="number" min="1" max="1000000" value="1" required disabled></div></div>
-        <label class="checkbox"><input id="task-infinite" type="checkbox" checked> 无限循环，直到手动停止</label>
-        <details id="ip-section"><summary>指定服务器 IP <span>可选</span></summary><label for="task-ip">服务器 IP 列表</label><textarea id="task-ip" rows="3" spellcheck="false" placeholder="192.168.1.10&#10;192.168.1.20"></textarea><p class="note">每行一个 IPv4 / IPv6 地址，不用填写域名。每次下载按填写顺序轮流使用，到末尾后从第一个重新开始；留空自动解析。</p><p class="note">仅用于下载链接的原域名；批量添加时，各任务分别使用这份 IP 列表。</p></details>
-        <details id="advanced-section"><summary>更多下载设置</summary><div class="form-grid"><div><label for="task-rate">限速（MiB/s）</label><input id="task-rate" type="number" min="0" max="100000" step="0.1" value="0"><p class="note">0 表示不限速</p></div><div><label for="task-timeout">读取超时（秒）</label><input id="task-timeout" type="number" min="1" max="120" value="15"></div><div><label for="task-interval">重复间隔（秒）</label><input id="task-interval" type="number" min="0" max="3600" step="0.1" value="0.2"></div></div></details>
+        <label for="task-urls">下载链接 <small id="url-note">每行一个，每条链接是一个独立任务</small></label>
+        <textarea id="task-urls" rows="4" required spellcheck="false" placeholder="https://example.com/file.bin"></textarea>
+
+        <label for="task-name">名称 <small>可留空，默认使用文件名</small></label>
+        <input id="task-name" maxlength="80">
+
+        <div class="grid">
+          <div><label for="task-concurrency">并发数</label><input id="task-concurrency" type="number" min="1" max="64" value="8" required></div>
+          <div><label for="task-repeat">下载次数</label><input id="task-repeat" type="number" min="1" max="1000000" value="1" required></div>
+        </div>
+        <label class="check"><input id="task-infinite" type="checkbox" checked> 无限循环，直到手动停止</label>
+
+        <details id="ip-section">
+          <summary>指定服务器 IP</summary>
+          <textarea id="task-ip" rows="3" spellcheck="false" placeholder="192.168.1.10&#10;2001:db8::10"></textarea>
+          <p class="hint">每行一个 IP，按顺序轮流使用。保留原域名的 Host 和 HTTPS 证书校验；留空则正常解析域名。</p>
+        </details>
+
+        <details id="advanced-section">
+          <summary>更多设置</summary>
+          <div class="grid">
+            <div><label for="task-rate">限速 MiB/s</label><input id="task-rate" type="number" min="0" max="100000" step="any" value="0"></div>
+            <div><label for="task-timeout">超时（秒）</label><input id="task-timeout" type="number" min="1" max="120" step="any" value="15"></div>
+            <div><label for="task-interval">重复间隔（秒）</label><input id="task-interval" type="number" min="0" max="3600" step="any" value="0.2"></div>
+            <div><label for="task-max">流量上限 GiB</label><input id="task-max" type="number" min="0" max="1000000" step="any" value="0"></div>
+            <div><label for="task-duration">运行时长（分钟）</label><input id="task-duration" type="number" min="0" max="525600" step="any" value="0"></div>
+          </div>
+          <p class="hint">填 0 表示不限制。</p>
+        </details>
       </fieldset>
-      <p id="form-error" class="form-error" role="alert"></p>
-      <div class="dialog-actions"><button type="button" id="cancel-dialog" class="secondary">取消</button><button type="submit" id="save-task" class="primary">添加任务</button></div>
+      <p id="form-error" class="error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="cancel">取消</button>
+        <button type="submit" id="save-task" class="primary">添加</button>
+      </div>
     </form>
   </dialog>
+
+  <dialog id="import-dialog" aria-labelledby="import-title">
+    <form id="import-form" method="dialog">
+      <h2 id="import-title">导入配置</h2>
+      <fieldset id="import-fields">
+        <label for="import-file">配置文件（.json）</label>
+        <input id="import-file" type="file" accept=".json,application/json" required>
+        <label class="check"><input type="radio" name="import-mode" value="append" checked> 追加到现有任务</label>
+        <label class="check"><input type="radio" name="import-mode" value="replace"> 替换全部任务（需先全部停止）</label>
+        <p class="hint">导入的任务处于停止状态，可点击“全部开始”启动。</p>
+      </fieldset>
+      <p id="import-error" class="error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="cancel">取消</button>
+        <button type="submit" id="import-submit" class="primary">导入</button>
+      </div>
+    </form>
+  </dialog>
+
   <div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>

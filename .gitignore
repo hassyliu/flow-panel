@@ -1,16 +1,5 @@
-# Runtime data and local builds
-/abc/
-/tasks.json
-/.flow-panel-tasks-*.tmp
-/flow-panel
-/flow-panel-alpine-*
-/dist/
-/work/
-*.exe
-*.log
+/target
+/data
 *.tmp
-*.zip
-*.tar.gz
 .env
 .env.*
-.DS_Store

@@ -1,0 +1,18 @@
+services:
+  flow-panel:
+    build: .
+    image: flow-panel:latest
+    container_name: flow-panel
+    restart: unless-stopped
+    ports:
+      - "8089:8089"
+    volumes:
+      - flow-panel-data:/data
+      # - ./ca.pem:/ca.pem:ro            # 内网私有 CA（可选）
+    # environment:
+    #   FLOW_PANEL_THREADS: "4"          # 工作线程数，默认 CPU 核数（最多 4）
+    #   FLOW_PANEL_CA_FILE: /ca.pem      # 配合上面的 ca.pem 挂载
+    # mem_limit: 128m
+
+volumes:
+  flow-panel-data:
