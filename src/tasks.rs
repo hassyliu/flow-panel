@@ -7,7 +7,8 @@ use crate::storage::{self, Record};
 use serde::Serialize;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::task::TaskTracker;
 
@@ -43,16 +44,23 @@ struct Task {
     run: Option<Arc<Run>>,
     /// The most recent run, kept to show its final state and last error.
     last_run: Option<Arc<Run>>,
+    /// The current run was stopped because its hours ended; keep it enabled.
+    paused: bool,
     error: String,
 }
 
 impl Task {
     fn new(id: String, name: String, config: Config, created_at: f64, enabled: bool) -> Task {
-        Task { id, name, config, created_at, enabled, run: None, last_run: None, error: String::new() }
+        Task { id, name, config, created_at, enabled, run: None, last_run: None, paused: false, error: String::new() }
     }
 
     fn busy(&self) -> bool {
         self.enabled || self.run.is_some()
+    }
+
+    fn in_hours(&self, hour: u8) -> bool {
+        let hours = &self.config.settings.hours;
+        hours.is_empty() || hours.contains(&hour)
     }
 
     fn record(&self) -> Record<'_> {
@@ -79,6 +87,7 @@ pub struct TaskView {
     pub server_ip: String,
     pub connection_host: String,
     pub ip_overridden: bool,
+    pub tls: String,
     pub busy: bool,
 }
 
@@ -91,10 +100,15 @@ pub struct Board {
     pub speed: f64,
     pub running: usize,
     pub queued: usize,
+    /// Enabled tasks outside their hours.
+    pub waiting: usize,
     pub active: u32,
     pub allocated: u32,
     pub max_workers: u32,
     pub max_tasks: usize,
+    /// Panel clock used for schedules, e.g. "14:05", and its zone, e.g. "UTC+8".
+    pub clock: String,
+    pub utc_offset: String,
 }
 
 struct Inner {
@@ -110,6 +124,10 @@ pub struct TaskManager {
     instance: String,
     inner: Mutex<Inner>,
     watchers: TaskTracker,
+    /// Time zone of the schedule hours, in minutes east of UTC.
+    utc_offset: AtomicI32,
+    #[cfg(test)]
+    fixed_hour: Mutex<Option<u8>>,
 }
 
 pub fn now() -> f64 {
@@ -139,7 +157,66 @@ impl TaskManager {
             instance,
             inner: Mutex::new(Inner { tasks, next_id, version: 0, closing: false }),
             watchers: TaskTracker::new(),
+            utc_offset: AtomicI32::new(8 * 60),
+            #[cfg(test)]
+            fixed_hour: Mutex::new(None),
         })
+    }
+
+    pub fn set_utc_offset(&self, minutes: i32) {
+        self.utc_offset.store(minutes, Ordering::Relaxed);
+    }
+
+    /// Minutes since local midnight in the schedule time zone.
+    fn local_minutes(&self) -> u32 {
+        let offset = i64::from(self.utc_offset.load(Ordering::Relaxed)) * 60;
+        let seconds = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 + offset;
+        (seconds.rem_euclid(86_400) / 60) as u32
+    }
+
+    fn hour(&self) -> u8 {
+        #[cfg(test)]
+        if let Some(hour) = *self.fixed_hour.lock().unwrap() {
+            return hour;
+        }
+        (self.local_minutes() / 60) as u8
+    }
+
+    #[cfg(test)]
+    fn set_hour(&self, hour: u8) {
+        *self.fixed_hour.lock().unwrap() = Some(hour);
+    }
+
+    /// Re-check schedules every few seconds: pause tasks whose hours ended and
+    /// start those whose hours began.
+    pub fn start_clock(self: &Arc<Self>) {
+        let manager: Weak<TaskManager> = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                ticker.tick().await;
+                let Some(manager) = manager.upgrade() else { return };
+                manager.tick();
+            }
+        });
+    }
+
+    pub fn tick(self: &Arc<Self>) {
+        let mut inner = self.lock();
+        if inner.closing {
+            return;
+        }
+        let hour = self.hour();
+        for task in inner.tasks.iter_mut() {
+            if let Some(run) = &task.run
+                && task.enabled
+                && !task.in_hours(hour)
+            {
+                task.paused = true;
+                run.stop("不在运行时段");
+            }
+        }
+        self.schedule(&mut inner);
     }
 
     pub fn data_file(&self) -> Option<&PathBuf> {
@@ -175,10 +252,11 @@ impl TaskManager {
         if inner.closing {
             return;
         }
+        let hour = self.hour();
         let mut allocated: u32 =
             inner.tasks.iter().filter(|t| t.run.is_some()).map(|t| t.config.settings.concurrency).sum();
         for task in inner.tasks.iter_mut() {
-            if !task.enabled || task.run.is_some() {
+            if !task.enabled || task.run.is_some() || !task.in_hours(hour) {
                 continue;
             }
             let needed = task.config.settings.concurrency;
@@ -204,9 +282,10 @@ impl TaskManager {
             return;
         }
         inner.tasks[index].run = None;
-        // A shutdown keeps the intent so the task resumes after restart; a run
-        // that finished or hit a limit is switched off for good.
-        let finished = !inner.closing || run.phase() == Phase::Completed;
+        // A shutdown or the end of the task's hours keeps the intent so the task
+        // resumes later; a run that finished or hit a limit is switched off.
+        let paused = std::mem::take(&mut inner.tasks[index].paused);
+        let finished = (!inner.closing && !paused) || run.phase() == Phase::Completed;
         if inner.tasks[index].enabled && finished {
             inner.tasks[index].enabled = false;
             if let Err(error) = self.save(&inner.tasks, inner.next_id) {
@@ -341,6 +420,7 @@ impl TaskManager {
         for &index in &targets {
             let task = &mut inner.tasks[index];
             task.error.clear();
+            task.paused = false;
             if let Some(run) = &task.run {
                 run.stop(reason);
             }
@@ -412,16 +492,30 @@ impl TaskManager {
             allocated: 0,
             max_workers: MAX_TOTAL_WORKERS,
             max_tasks: MAX_TASKS,
+            waiting: 0,
+            clock: String::new(),
+            utc_offset: String::new(),
         };
+        let minutes = self.local_minutes();
+        let offset = self.utc_offset.load(Ordering::Relaxed);
+        board.clock = format!("{:02}:{:02}", minutes / 60, minutes % 60);
+        board.utc_offset = match (offset / 60, offset % 60) {
+            (hours, 0) => format!("UTC{hours:+}"),
+            (hours, mins) => format!("UTC{}{}:{:02}", if offset < 0 { "-" } else { "+" }, hours.abs(), mins.abs()),
+        };
+        let hour = self.hour();
         for task in &inner.tasks {
-            let view = view(task);
+            let view = view(task, hour);
             board.speed += view.speed;
             board.active += view.active;
-            if task.run.is_some() {
-                board.running += 1;
-                board.allocated += task.config.settings.concurrency;
-            } else if task.enabled {
-                board.queued += 1;
+            match view.state {
+                "queued" => board.queued += 1,
+                "waiting" => board.waiting += 1,
+                _ if task.run.is_some() => {
+                    board.running += 1;
+                    board.allocated += task.config.settings.concurrency;
+                }
+                _ => {}
             }
             board.tasks.push(view);
         }
@@ -444,7 +538,7 @@ impl TaskManager {
     }
 }
 
-fn view(task: &Task) -> TaskView {
+fn view(task: &Task, hour: u8) -> TaskView {
     let mut view = TaskView {
         id: task.id.clone(),
         name: task.name.clone(),
@@ -457,11 +551,10 @@ fn view(task: &Task) -> TaskView {
         server_ip: String::new(),
         connection_host: String::new(),
         ip_overridden: false,
+        tls: String::new(),
         busy: task.busy(),
     };
-    if task.enabled && task.run.is_none() {
-        view.state = "queued";
-    } else if let Some(run) = task.run.as_ref().or(task.last_run.as_ref()) {
+    if let Some(run) = task.run.as_ref().or(task.last_run.as_ref()) {
         let run = run.view();
         view.state = run.phase.as_str();
         view.speed = run.speed;
@@ -470,6 +563,12 @@ fn view(task: &Task) -> TaskView {
         view.server_ip = run.server_ip;
         view.connection_host = run.connection_host;
         view.ip_overridden = run.ip_overridden;
+        view.tls = run.tls;
+    }
+    if task.enabled && task.run.is_none() {
+        // Waiting for capacity, or for the task's hours to begin.
+        view.state = if task.in_hours(hour) { "queued" } else { "waiting" };
+        view.speed = 0.0;
     }
     if !task.error.is_empty() {
         view.last_error = task.error.clone();
@@ -587,6 +686,34 @@ mod tests {
         eventually("small task started", || state(&m, &small[0]).0 == "running").await;
         assert_eq!(m.board().allocated, 193);
         m.stop_all().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hours_start_and_pause_tasks() {
+        let o = origin("127.0.0.1:0", |p, _| default_reply(p)).await;
+        let m = TaskManager::memory(test_engine());
+        m.set_hour(10);
+        let url = format!("http://127.0.0.1:{}/slow", o.port);
+        let ids = m.add(request(&[url], json!({"repeat": 0, "concurrency": 1, "hours": [11, 12]}))).unwrap();
+        assert_eq!(state(&m, &ids[0]), ("waiting", true));
+        assert_eq!(m.board().waiting, 1);
+        m.set_hour(11);
+        m.tick();
+        assert_eq!(state(&m, &ids[0]), ("running", true));
+        m.set_hour(12);
+        m.tick();
+        assert_eq!(state(&m, &ids[0]).0, "running", "stopped inside its hours");
+        m.set_hour(13);
+        m.tick();
+        eventually("paused outside hours", || state(&m, &ids[0]) == ("waiting", true)).await;
+        m.set_hour(11);
+        m.tick();
+        assert_eq!(state(&m, &ids[0]), ("running", true));
+        m.stop(&ids[0]).unwrap();
+        eventually("stopped by user", || state(&m, &ids[0]) == ("stopped", false)).await;
+        m.set_hour(12);
+        m.tick();
+        assert_eq!(state(&m, &ids[0]), ("stopped", false), "a stopped task was started by its schedule");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -9,36 +9,48 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <header>
-    <div class="brand">Flow Panel <span id="version"></span></div>
-    <div class="summary">
-      <span id="connection" class="connection">连接中…</span>
-      <span id="counts" class="muted"></span>
-      <span class="total">总网速 <strong id="total-speed">0 B/s</strong></span>
+  <header class="topbar">
+    <div class="brand"><img src="/favicon.svg" alt="" width="26" height="26"><span>Flow Panel</span><small id="version"></small></div>
+    <div class="top-right">
+      <span id="clock" class="clock" title="定时所用的服务器时间"></span>
+      <span id="connection" class="pill">连接中…</span>
     </div>
   </header>
 
   <main>
-    <div class="toolbar">
-      <input id="search" type="search" placeholder="搜索名称或链接" aria-label="搜索任务">
-      <div class="actions">
-        <button id="import" type="button">导入</button>
-        <button id="export" type="button">导出</button>
-        <span class="divider"></span>
-        <button id="start-all" type="button">全部开始</button>
-        <button id="stop-all" type="button">全部停止</button>
-        <button id="add-task" type="button" class="primary">添加任务</button>
-      </div>
-    </div>
+    <section class="stats" aria-label="概览">
+      <div class="stat primary"><span>总网速</span><strong id="total-speed">0 B/s</strong></div>
+      <div class="stat"><span>运行中</span><strong id="stat-running">0</strong><small id="stat-total"></small></div>
+      <div class="stat"><span>排队 / 等待时段</span><strong id="stat-waiting">0 / 0</strong></div>
+      <div class="stat"><span>并发占用</span><strong id="stat-workers">0 / 256</strong><div class="meter"><i id="worker-meter"></i></div></div>
+    </section>
 
-    <table>
-      <thead>
-        <tr><th>任务</th><th>状态</th><th>并发</th><th>次数</th><th class="num">网速</th><th class="ops">操作</th></tr>
-      </thead>
-      <tbody id="task-body"></tbody>
-    </table>
-    <p id="empty" class="empty" hidden>还没有任务。点击“添加任务”，或导入配置文件。</p>
-    <p id="no-results" class="empty" hidden>没有匹配的任务。</p>
+    <section class="panel">
+      <div class="toolbar">
+        <input id="search" type="search" placeholder="搜索名称或链接" aria-label="搜索任务">
+        <div class="actions">
+          <button id="import" type="button" class="ghost">导入</button>
+          <button id="export" type="button" class="ghost">导出</button>
+          <span class="sep"></span>
+          <button id="start-all" type="button">全部开始</button>
+          <button id="stop-all" type="button">全部停止</button>
+          <button id="add-task" type="button" class="primary">＋ 添加任务</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>任务</th><th>状态</th><th class="c">并发</th><th class="c">次数</th><th class="r">网速</th><th class="r">操作</th></tr>
+          </thead>
+          <tbody id="task-body"></tbody>
+        </table>
+      </div>
+      <div id="empty" class="empty" hidden>
+        <p>还没有任务</p>
+        <small>点击“添加任务”，或导入配置文件</small>
+      </div>
+      <p id="no-results" class="empty" hidden>没有匹配的任务</p>
+    </section>
   </main>
 
   <dialog id="task-dialog" aria-labelledby="form-title">
@@ -57,6 +69,19 @@
         </div>
         <label class="check"><input id="task-infinite" type="checkbox" checked> 无限循环，直到手动停止</label>
 
+        <details id="hours-section">
+          <summary>运行时段 <small id="hours-summary">全天</small></summary>
+          <label class="check"><input id="hours-limit" type="checkbox"> 只在选中的小时运行 <small id="hours-zone"></small></label>
+          <div id="hours-grid" class="hours" aria-label="选择运行的小时"></div>
+          <div class="presets">
+            <button type="button" data-hours="all">全选</button>
+            <button type="button" data-hours="none">清空</button>
+            <button type="button" data-hours="day">白天 8–23</button>
+            <button type="button" data-hours="night">夜间 0–7</button>
+          </div>
+          <p class="hint">在选中的小时自动开始，其他时间自动暂停；手动停止后不会再被定时启动。</p>
+        </details>
+
         <details id="ip-section">
           <summary>指定服务器 IP</summary>
           <textarea id="task-ip" rows="3" spellcheck="false" placeholder="192.168.1.10&#10;2001:db8::10"></textarea>
@@ -67,17 +92,18 @@
           <summary>更多设置</summary>
           <div class="grid">
             <div><label for="task-rate">限速 MiB/s</label><input id="task-rate" type="number" min="0" max="100000" step="any" value="0"></div>
+            <div><label for="task-interval">重复间隔（秒）</label><input id="task-interval" type="number" min="0" max="3600" step="any" value="0"></div>
             <div><label for="task-timeout">超时（秒）</label><input id="task-timeout" type="number" min="1" max="120" step="any" value="15"></div>
-            <div><label for="task-interval">重复间隔（秒）</label><input id="task-interval" type="number" min="0" max="3600" step="any" value="0.2"></div>
             <div><label for="task-max">流量上限 GiB</label><input id="task-max" type="number" min="0" max="1000000" step="any" value="0"></div>
             <div><label for="task-duration">运行时长（分钟）</label><input id="task-duration" type="number" min="0" max="525600" step="any" value="0"></div>
           </div>
-          <p class="hint">填 0 表示不限制。</p>
+          <label class="check"><input id="task-keepalive" type="checkbox" checked> 复用连接（Keep-Alive），小文件省 CPU</label>
+          <p class="hint">数值填 0 表示不限制。</p>
         </details>
       </fieldset>
       <p id="form-error" class="error" role="alert"></p>
       <div class="dialog-actions">
-        <button type="button" class="cancel">取消</button>
+        <button type="button" class="cancel ghost">取消</button>
         <button type="submit" id="save-task" class="primary">添加</button>
       </div>
     </form>
@@ -95,7 +121,7 @@
       </fieldset>
       <p id="import-error" class="error" role="alert"></p>
       <div class="dialog-actions">
-        <button type="button" class="cancel">取消</button>
+        <button type="button" class="cancel ghost">取消</button>
         <button type="submit" id="import-submit" class="primary">导入</button>
       </div>
     </form>

@@ -5,8 +5,9 @@ use crate::config::{Config, host_key, normalize_url};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
+use hyper::client::conn::http1::SendRequest;
 use hyper::header::{ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, HOST, LOCATION, USER_AGENT};
-use hyper::{Request, Response};
+use hyper::{Request, Response, Version};
 use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
@@ -28,6 +29,8 @@ const READ_BUFFER: usize = 32 * 1024;
 const SPEED_SAMPLES: usize = 5;
 const MAX_REDIRECTS: u32 = 5;
 const MAX_ERROR_CHARS: usize = 240;
+/// Pooled keep-alive connections unused for this long are closed.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Process-wide download context.
 pub struct Engine {
@@ -68,6 +71,7 @@ pub struct RunView {
     pub server_ip: String,
     pub connection_host: String,
     pub ip_overridden: bool,
+    pub tls: String,
 }
 
 /// Counters used by tests and logs; not exposed in the API.
@@ -94,6 +98,8 @@ pub struct Run {
     done: CancellationToken,
     started: Instant,
     state: Mutex<State>,
+    /// Idle keep-alive connections, at most `concurrency` of them.
+    idle: Mutex<Vec<Conn>>,
 }
 
 struct State {
@@ -114,6 +120,7 @@ struct State {
     server_ip: String,
     connection_host: String,
     ip_overridden: bool,
+    tls: String,
     ended: Option<Instant>,
 }
 
@@ -165,8 +172,10 @@ impl Run {
                 server_ip: String::new(),
                 connection_host: String::new(),
                 ip_overridden: false,
+                tls: String::new(),
                 ended: None,
             }),
+            idle: Mutex::new(Vec::new()),
         });
         tokio::spawn(run.clone().supervise());
         run
@@ -217,6 +226,7 @@ impl Run {
             server_ip: state.server_ip.clone(),
             connection_host: state.connection_host.clone(),
             ip_overridden: state.ip_overridden,
+            tls: state.tls.clone(),
         }
     }
 
@@ -278,6 +288,7 @@ impl Run {
             }
         }
         self.cancel.cancel();
+        self.idle.lock().unwrap_or_else(|p| p.into_inner()).clear();
         {
             let mut state = self.lock();
             state.ended = Some(Instant::now());
@@ -384,14 +395,15 @@ impl Run {
         });
         let mut redirects = 0;
         loop {
-            let key = host_key(&url);
-            let pinned = route.as_ref().filter(|(host, _)| *host == key).map(|(_, ip)| *ip);
-            let (response, peer, _connection) = self.request(&url, pinned, limit).await?;
+            let host = host_key(&url);
+            let pinned = route.as_ref().filter(|(h, _)| *h == host).map(|(_, ip)| *ip);
+            let (response, conn) = self.request(&url, pinned, limit).await?;
             {
                 let mut state = self.lock();
-                state.connection_host = key;
-                state.server_ip = peer;
+                state.connection_host = host;
+                state.server_ip = conn.peer.clone();
                 state.ip_overridden = pinned.is_some();
+                state.tls = conn.tls.clone();
             }
             let status = response.status();
             let location = response.headers().get(LOCATION);
@@ -408,17 +420,68 @@ impl Run {
             if !status.is_success() {
                 return Err(format!("HTTP {status}"));
             }
-            return self.consume(response.into_body(), limit).await;
+            let reusable = response.version() == Version::HTTP_11
+                && !response
+                    .headers()
+                    .get(CONNECTION)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.to_ascii_lowercase().contains("close"));
+            self.consume(response.into_body(), limit).await?;
+            if reusable && self.config.settings.keep_alive {
+                self.park(conn);
+            }
+            return Ok(());
         }
     }
 
+    /// Take an idle connection to the same scheme, host, port and IP.
+    fn take_idle(&self, key: &ConnKey) -> Option<Conn> {
+        let mut idle = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        idle.retain(|conn| !conn.sender.is_closed() && conn.idle_since.elapsed() < IDLE_TIMEOUT);
+        let index = idle.iter().position(|conn| conn.key == *key)?;
+        Some(idle.swap_remove(index))
+    }
+
+    fn park(&self, mut conn: Conn) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        conn.idle_since = Instant::now();
+        let mut idle = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        if idle.len() >= self.config.settings.concurrency as usize {
+            idle.remove(0);
+        }
+        idle.push(conn);
+    }
+
+    /// Send the request, on a pooled connection when possible.
     async fn request(
         &self,
         url: &Url,
         pinned: Option<IpAddr>,
         limit: Duration,
-    ) -> Result<(Response<Incoming>, String, AbortOnDrop), String> {
-        let port = url.port_or_known_default().ok_or("链接缺少端口")?;
+    ) -> Result<(Response<Incoming>, Conn), String> {
+        let keep_alive = self.config.settings.keep_alive;
+        let key = ConnKey {
+            https: url.scheme() == "https",
+            host: host_key(url),
+            port: url.port_or_known_default().ok_or("链接缺少端口")?,
+            pinned,
+        };
+        if keep_alive && let Some(mut conn) = self.take_idle(&key) {
+            // A pooled connection may have been closed by the server meanwhile;
+            // GET is idempotent, so fall back to a fresh connection on failure.
+            if let Ok(response) = conn.send(build_request(url, keep_alive)?, limit).await {
+                return Ok((response, conn));
+            }
+        }
+        let mut conn = self.connect(url, key, limit).await?;
+        let response = conn.send(build_request(url, keep_alive)?, limit).await?;
+        Ok((response, conn))
+    }
+
+    async fn connect(&self, url: &Url, key: ConnKey, limit: Duration) -> Result<Conn, String> {
+        let (port, pinned) = (key.port, key.pinned);
         let addresses: Vec<SocketAddr> = match (pinned, url.host()) {
             (Some(ip), _) => vec![SocketAddr::new(ip, port)],
             (None, Some(Host::Ipv4(ip))) => vec![SocketAddr::new(ip.into(), port)],
@@ -444,37 +507,25 @@ impl Run {
         }
         let (stream, address) = connected.ok_or(failure)?;
         let _ = stream.set_nodelay(true);
-        let host = url.host_str().unwrap_or_default();
-        let host_header = match url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_owned(),
+        let peer = address.ip().to_string();
+        if !key.https {
+            let (sender, task) = handshake(TokioIo::new(stream), limit).await?;
+            return Ok(Conn { key, sender, _task: task, peer, tls: String::new(), idle_since: Instant::now() });
+        }
+        let name = match url.host() {
+            Some(Host::Domain(domain)) => ServerName::try_from(domain.trim_end_matches('.').to_owned())
+                .map_err(|_| format!("域名无法用于 TLS：{domain}"))?,
+            Some(Host::Ipv4(ip)) => ServerName::IpAddress(IpAddr::from(ip).into()),
+            Some(Host::Ipv6(ip)) => ServerName::IpAddress(IpAddr::from(ip).into()),
+            None => return Err("链接缺少域名".into()),
         };
-        let target = &url[url::Position::BeforePath..url::Position::AfterQuery];
-        let request = Request::get(if target.is_empty() { "/" } else { target })
-            .header(HOST, host_header)
-            .header(USER_AGENT, AGENT)
-            .header(ACCEPT_ENCODING, "identity")
-            .header(CACHE_CONTROL, "no-cache")
-            .header(CONNECTION, "close")
-            .body(Empty::<Bytes>::new())
-            .map_err(|e| e.to_string())?;
-        let (response, connection) = if url.scheme() == "https" {
-            let name = match url.host() {
-                Some(Host::Domain(domain)) => ServerName::try_from(domain.trim_end_matches('.').to_owned())
-                    .map_err(|_| format!("域名无法用于 TLS：{domain}"))?,
-                Some(Host::Ipv4(ip)) => ServerName::IpAddress(IpAddr::from(ip).into()),
-                Some(Host::Ipv6(ip)) => ServerName::IpAddress(IpAddr::from(ip).into()),
-                None => return Err("链接缺少域名".into()),
-            };
-            let tls = timeout(limit, TlsConnector::from(self.engine.tls.clone()).connect(name, stream))
-                .await
-                .map_err(|_| "TLS 握手超时".to_owned())?
-                .map_err(|e| format!("TLS 握手失败：{e}"))?;
-            send(TokioIo::new(tls), request, limit).await?
-        } else {
-            send(TokioIo::new(stream), request, limit).await?
-        };
-        Ok((response, address.ip().to_string(), connection))
+        let stream = timeout(limit, TlsConnector::from(self.engine.tls.clone()).connect(name, stream))
+            .await
+            .map_err(|_| "TLS 握手超时".to_owned())?
+            .map_err(|e| format!("TLS 握手失败：{e}"))?;
+        let tls = describe_tls(stream.get_ref().1);
+        let (sender, task) = handshake(TokioIo::new(stream), limit).await?;
+        Ok(Conn { key, sender, _task: task, peer, tls, idle_since: Instant::now() })
     }
 
     async fn consume(&self, mut body: Incoming, limit: Duration) -> Result<(), String> {
@@ -515,28 +566,84 @@ impl Run {
     }
 }
 
-async fn send<T>(
-    io: T,
-    request: Request<Empty<Bytes>>,
-    limit: Duration,
-) -> Result<(Response<Incoming>, AbortOnDrop), String>
+/// Identifies connections that can serve the same request.
+#[derive(Clone, PartialEq, Eq)]
+struct ConnKey {
+    https: bool,
+    host: String,
+    port: u16,
+    pinned: Option<IpAddr>,
+}
+
+/// An open HTTP/1.1 connection. Dropping it closes the connection.
+struct Conn {
+    key: ConnKey,
+    sender: SendRequest<Empty<Bytes>>,
+    _task: AbortOnDrop,
+    peer: String,
+    tls: String,
+    idle_since: Instant,
+}
+
+impl Conn {
+    async fn send(&mut self, request: Request<Empty<Bytes>>, limit: Duration) -> Result<Response<Incoming>, String> {
+        timeout(limit, self.sender.ready())
+            .await
+            .map_err(|_| "连接超时".to_owned())?
+            .map_err(|e| format!("连接已断开：{e}"))?;
+        timeout(limit, self.sender.send_request(request))
+            .await
+            .map_err(|_| "等待响应超时".to_owned())?
+            .map_err(|e| format!("请求失败：{e}"))
+    }
+}
+
+fn build_request(url: &Url, keep_alive: bool) -> Result<Request<Empty<Bytes>>, String> {
+    let host = url.host_str().unwrap_or_default();
+    let host_header = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
+    let target = &url[url::Position::BeforePath..url::Position::AfterQuery];
+    Request::get(if target.is_empty() { "/" } else { target })
+        .header(HOST, host_header)
+        .header(USER_AGENT, AGENT)
+        .header(ACCEPT_ENCODING, "identity")
+        .header(CACHE_CONTROL, "no-cache")
+        .header(CONNECTION, if keep_alive { "keep-alive" } else { "close" })
+        .body(Empty::<Bytes>::new())
+        .map_err(|e| e.to_string())
+}
+
+async fn handshake<T>(io: T, limit: Duration) -> Result<(SendRequest<Empty<Bytes>>, AbortOnDrop), String>
 where
     T: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
     let mut builder = hyper::client::conn::http1::Builder::new();
     builder.read_buf_exact_size(Some(READ_BUFFER));
-    let (mut sender, connection) = timeout(limit, builder.handshake(io))
+    let (sender, connection) = timeout(limit, builder.handshake(io))
         .await
         .map_err(|_| "连接超时".to_owned())?
         .map_err(|e| format!("连接失败：{e}"))?;
-    let guard = AbortOnDrop(tokio::spawn(async move {
+    let task = AbortOnDrop(tokio::spawn(async move {
         let _ = connection.await;
     }));
-    let response = timeout(limit, sender.send_request(request))
-        .await
-        .map_err(|_| "等待响应超时".to_owned())?
-        .map_err(|e| format!("请求失败：{e}"))?;
-    Ok((response, guard))
+    Ok((sender, task))
+}
+
+/// "TLS1.3 CHACHA20_POLY1305_SHA256" style summary of the negotiated session.
+fn describe_tls(session: &rustls::ClientConnection) -> String {
+    let version = match session.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => "TLS1.3",
+        Some(rustls::ProtocolVersion::TLSv1_2) => "TLS1.2",
+        _ => "TLS",
+    };
+    let suite = session.negotiated_cipher_suite().map(|s| format!("{:?}", s.suite())).unwrap_or_default();
+    let suite = ["TLS13_", "TLS_ECDHE_RSA_WITH_", "TLS_ECDHE_ECDSA_WITH_"]
+        .iter()
+        .find_map(|prefix| suite.strip_prefix(prefix))
+        .unwrap_or(&suite);
+    format!("{version} {suite}")
 }
 
 #[cfg(test)]
@@ -572,6 +679,8 @@ pub(crate) mod tests {
         pub hits: Arc<AtomicUsize>,
         pub peak: Arc<AtomicUsize>,
         pub hosts: Arc<Mutex<Vec<String>>>,
+        /// Accepted TCP connections.
+        pub connections: Arc<AtomicUsize>,
     }
 
     pub fn default_reply(path: &str) -> Reply {
@@ -598,12 +707,15 @@ pub(crate) mod tests {
             hits: Arc::default(),
             peak: Arc::default(),
             hosts: Arc::default(),
+            connections: Arc::default(),
         };
         let (hits, peak, hosts) = (origin.hits.clone(), origin.peak.clone(), origin.hosts.clone());
+        let connections = origin.connections.clone();
         let active = Arc::new(AtomicUsize::new(0));
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else { return };
+                connections.fetch_add(1, Ordering::SeqCst);
                 let (hits, peak, hosts, active) = (hits.clone(), peak.clone(), hosts.clone(), active.clone());
                 tokio::spawn(async move {
                     let now = active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -618,93 +730,98 @@ pub(crate) mod tests {
         Some(origin)
     }
 
+    /// Serve requests on one connection; keeps it open unless the client asks
+    /// to close (keep-alive) or the reply breaks the connection on purpose.
     pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         mut stream: S,
         route: fn(&str, &str) -> Reply,
         hits: &AtomicUsize,
         hosts: &Mutex<Vec<String>>,
     ) {
-        let mut head = Vec::new();
-        let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            match stream.read(&mut byte).await {
-                Ok(1) => head.push(byte[0]),
-                _ => return,
-            }
-        }
-        let head = String::from_utf8_lossy(&head).into_owned();
-        let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
-        let host = head
-            .lines()
-            .find_map(|line| line.strip_prefix("host: ").or_else(|| line.strip_prefix("Host: ")))
-            .unwrap_or_default()
-            .to_owned();
-        hits.fetch_add(1, Ordering::SeqCst);
-        hosts.lock().unwrap().push(host.clone());
         let block = vec![b'x'; 8192];
-        match route(&path, &host) {
-            Reply::File { delay, chunked } => {
-                let header = if chunked { "Transfer-Encoding: chunked" } else { "Content-Length: 65536" };
-                let _ = stream
-                    .write_all(format!("HTTP/1.1 200 OK\r\n{header}\r\nConnection: close\r\n\r\n").as_bytes())
-                    .await;
-                for index in 0..8 {
-                    if index > 0 && !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
+        loop {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte).await {
+                    Ok(1) => head.push(byte[0]),
+                    _ => return,
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let lower = head.to_ascii_lowercase();
+            let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
+            let host = lower.lines().find_map(|line| line.strip_prefix("host: ")).unwrap_or_default().to_owned();
+            let keep = !lower.contains("\r\nconnection: close");
+            let connection = if keep { "keep-alive" } else { "close" };
+            hits.fetch_add(1, Ordering::SeqCst);
+            hosts.lock().unwrap().push(host.clone());
+            let simple = |status: &str, extra: &str, body: &str| {
+                format!(
+                    "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: {connection}\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            match route(&path, &host) {
+                Reply::File { delay, chunked } => {
+                    let length = if chunked { "Transfer-Encoding: chunked" } else { "Content-Length: 65536" };
+                    let header = format!("HTTP/1.1 200 OK\r\n{length}\r\nConnection: {connection}\r\n\r\n");
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    for index in 0..8 {
+                        if index > 0 && !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        if chunked {
+                            let _ = stream.write_all(b"2000\r\n").await;
+                        }
+                        if stream.write_all(&block).await.is_err() {
+                            return;
+                        }
+                        if chunked {
+                            let _ = stream.write_all(b"\r\n").await;
+                        }
+                        let _ = stream.flush().await;
                     }
                     if chunked {
-                        let _ = stream.write_all(b"2000\r\n").await;
+                        let _ = stream.write_all(b"0\r\n\r\n").await;
                     }
-                    if stream.write_all(&block).await.is_err() {
+                    if !keep {
+                        // Return as soon as the body is written; dropping the stream closes it.
                         return;
                     }
-                    if chunked {
-                        let _ = stream.write_all(b"\r\n").await;
-                    }
+                }
+                Reply::Status(code) => {
+                    let _ = stream.write_all(simple(&format!("{code} Unavailable"), "", "").as_bytes()).await;
+                }
+                Reply::Redirect(location) => {
+                    let extra = format!("Location: {location}\r\n");
+                    let _ = stream.write_all(simple("302 Found", &extra, "").as_bytes()).await;
+                }
+                Reply::Text(text) => {
+                    let _ = stream.write_all(simple("200 OK", "", text).as_bytes()).await;
+                }
+                Reply::Hang => {
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n").await;
                     let _ = stream.flush().await;
+                    let mut sink = [0u8; 64];
+                    let _ = stream.read(&mut sink).await;
+                    return;
                 }
-                if chunked {
-                    let _ = stream.write_all(b"0\r\n\r\n").await;
+                Reply::Truncated => {
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 131072\r\n\r\n").await;
+                    for _ in 0..8 {
+                        let _ = stream.write_all(&block).await;
+                    }
+                    let _ = stream.shutdown().await;
+                    return;
                 }
-                // Return as soon as the body is written; dropping the stream closes it.
+            }
+            let _ = stream.flush().await;
+            if !keep {
+                let _ = stream.shutdown().await;
                 return;
             }
-            Reply::Status(code) => {
-                let _ = stream
-                    .write_all(
-                        format!("HTTP/1.1 {code} Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                            .as_bytes(),
-                    )
-                    .await;
-            }
-            Reply::Redirect(location) => {
-                let _ = stream
-                    .write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
-                    .await;
-            }
-            Reply::Hang => {
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n").await;
-                let _ = stream.flush().await;
-                let mut sink = [0u8; 64];
-                let _ = stream.read(&mut sink).await;
-            }
-            Reply::Truncated => {
-                let _ =
-                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 131072\r\nConnection: close\r\n\r\n").await;
-                for _ in 0..8 {
-                    let _ = stream.write_all(&block).await;
-                }
-            }
-            Reply::Text(text) => {
-                let _ = stream
-                    .write_all(
-                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len())
-                            .as_bytes(),
-                    )
-                    .await;
-            }
         }
-        let _ = stream.shutdown().await;
     }
 
     pub fn test_engine() -> Arc<Engine> {
@@ -752,6 +869,44 @@ pub(crate) mod tests {
         let stats = run_url(format!("http://127.0.0.1:{}/file", o.port), json!({"concurrency": 64})).await;
         assert_eq!(stats.success, 1);
         assert_eq!(o.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keep_alive_reuses_connections() {
+        let o = origin("127.0.0.1:0", |p, _| default_reply(p)).await;
+        let url = format!("http://127.0.0.1:{}/file", o.port);
+        let stats = run_url(url, json!({"repeat": 20, "concurrency": 2})).await;
+        assert_eq!((stats.success, stats.total), (20, 20 * FILE));
+        let opened = o.connections.load(Ordering::SeqCst);
+        assert!(opened <= 2, "{opened} connections for 20 downloads");
+
+        let o = origin("127.0.0.1:0", |p, _| default_reply(p)).await;
+        let url = format!("http://127.0.0.1:{}/file", o.port);
+        let stats = run_url(url, json!({"repeat": 6, "concurrency": 2, "keep_alive": false})).await;
+        assert_eq!(stats.success, 6);
+        assert_eq!(o.connections.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_pooled_connection_is_replaced() {
+        // The server announces keep-alive but closes every connection after one
+        // response, so each pooled connection is stale when it is reused.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                });
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let stats = run_url(url, json!({"repeat": 5, "concurrency": 1, "interval": 0.05})).await;
+        assert_eq!((stats.success, stats.failed), (5, 0), "{stats:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

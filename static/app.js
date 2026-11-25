@@ -2,7 +2,7 @@
 
 const $ = (id) => document.getElementById(id);
 const STATE_NAMES = {
-  queued: "排队中", idle: "未启动", running: "运行中",
+  queued: "排队中", waiting: "等待时段", idle: "未启动", running: "运行中",
   stopping: "停止中", stopped: "已停止", completed: "已完成",
 };
 
@@ -14,11 +14,37 @@ let toastTimer = null;
 const pending = new Set(); // task ids (or "all") with a request in flight
 const rows = new Map();    // task id -> row elements
 
+/* ---------- formatting ---------- */
+
 function formatRate(value) {
   if (!value || value < 1) return "0 B/s";
   const units = ["B/s", "KiB/s", "MiB/s", "GiB/s"];
   const i = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
   return `${(value / 1024 ** i).toFixed(i ? 2 : 0)} ${units[i]}`;
+}
+
+const pad = (n) => String(n).padStart(2, "0");
+
+/** [8,9,10,20] -> "08:00–11:00, 20:00–21:00" */
+function hoursText(hours) {
+  if (!hours || hours.length === 0) return "全天";
+  const ranges = [];
+  for (const h of hours) {
+    const last = ranges[ranges.length - 1];
+    if (last && last[1] === h - 1) last[1] = h; else ranges.push([h, h]);
+  }
+  return ranges.map(([a, b]) => `${pad(a)}:00–${pad(b + 1)}:00`).join(", ");
+}
+
+/** 24-segment gradient: selected hours in the accent colour. */
+function hoursStrip(hours) {
+  const set = new Set(hours);
+  const stops = [];
+  for (let h = 0; h < 24; h++) {
+    const color = set.has(h) ? "var(--accent)" : "var(--line)";
+    stops.push(`${color} ${(h / 24 * 100).toFixed(2)}% ${((h + 1) / 24 * 100).toFixed(2)}%`);
+  }
+  return `linear-gradient(to right, ${stops.join(", ")})`;
 }
 
 function toast(message, isError = false) {
@@ -29,6 +55,8 @@ function toast(message, isError = false) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { node.hidden = true; }, 4500);
 }
+
+/* ---------- API ---------- */
 
 async function api(path, method = "GET", body) {
   const controller = new AbortController();
@@ -71,73 +99,85 @@ async function poll() {
 }
 
 async function act(key, path, method = "POST", body = {}) {
-  if (pending.has(key)) return false;
+  if (pending.has(key)) return;
   pending.add(key);
   render();
   try {
     apply(await api(path, method, body));
-    return true;
   } catch (error) {
     toast(error.message, true);
-    return false;
   } finally {
     pending.delete(key);
     render();
   }
 }
 
+/* ---------- task list ---------- */
+
+function el(tag, className, parent) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (parent) parent.append(node);
+  return node;
+}
+
 function makeRow(id) {
-  const tr = document.createElement("tr");
-  const cell = (className) => {
-    const td = document.createElement("td");
-    if (className) td.className = className;
-    tr.append(td);
-    return td;
-  };
-  const div = (parent, className) => {
-    const node = document.createElement("div");
-    node.className = className;
-    parent.append(node);
-    return node;
-  };
-  const task = cell();
-  const status = cell();
+  const tr = el("tr");
+  const task = el("td", "", tr);
+  const status = el("td", "", tr);
   const row = {
     tr,
-    name: div(task, "task-name"),
-    url: div(task, "task-url"),
-    route: div(task, "task-route"),
-    state: div(status, "state"),
-    error: div(status, "task-error"),
-    concurrency: cell("mono"),
-    repeat: cell("mono"),
-    speed: cell("num speed"),
+    name: el("div", "name", task),
+    url: el("div", "url", task),
+    meta: el("div", "meta", task),
+    state: el("span", "state", status),
+    error: el("div", "task-error", status),
+    concurrency: el("td", "c mono", tr),
+    repeat: el("td", "c mono", tr),
     buttons: {},
   };
-  const ops = cell("ops");
+  const speedCell = el("td", "r", tr);
+  row.speed = el("div", "speed", speedCell);
+  row.bar = el("i", "", el("div", "bar", speedCell));
+  const ops = el("td", "r ops", tr);
   for (const [action, label, className] of [
-    ["start", "启动", "primary"], ["stop", "停止", ""], ["edit", "编辑", ""], ["delete", "删除", "danger"],
+    ["start", "启动", "primary"], ["stop", "停止", ""], ["edit", "编辑", "ghost"], ["delete", "删除", "ghost danger"],
   ]) {
-    const button = document.createElement("button");
+    const button = el("button", className, ops);
     button.type = "button";
     button.textContent = label;
-    button.className = className;
     button.dataset.action = action;
     button.dataset.id = id;
-    ops.append(button, " ");
     row.buttons[action] = button;
   }
-  $("task-body").append(tr);
   rows.set(id, row);
   return row;
 }
 
-function routeText(task) {
-  const ips = task.config.server_ips || [];
-  if (task.server_ip) return `最近连接 ${task.server_ip}${task.ip_overridden ? "（指定 IP）" : ""}`;
-  if (ips.length === 1) return `指定 IP ${ips[0]}`;
-  if (ips.length > 1) return `${ips.length} 个 IP 轮询`;
-  return "";
+function renderMeta(row, task) {
+  const c = task.config;
+  const chips = [];
+  const ips = c.server_ips || [];
+  if (task.server_ip) chips.push([`${task.ip_overridden ? "指定 " : ""}${task.server_ip}`, task.connection_host]);
+  else if (ips.length) chips.push([ips.length === 1 ? `指定 ${ips[0]}` : `${ips.length} 个 IP 轮询`, ""]);
+  if (task.tls) chips.push([task.tls, "协商到的 TLS 版本和加密套件"]);
+  if (!c.keep_alive) chips.push(["不复用连接", ""]);
+  const key = JSON.stringify([chips, c.hours]);
+  if (row.metaKey === key) return; // avoid rebuilding unchanged chips every second
+  row.metaKey = key;
+  row.meta.replaceChildren();
+  for (const [text, title] of chips) {
+    const chip = el("span", "chip", row.meta);
+    chip.textContent = text;
+    if (title) chip.title = title;
+  }
+  if (c.hours && c.hours.length) {
+    const chip = el("span", "chip hours", row.meta);
+    const strip = el("span", "strip", chip);
+    strip.style.background = hoursStrip(c.hours);
+    chip.append(hoursText(c.hours));
+  }
+  row.meta.hidden = row.meta.childElementCount === 0;
 }
 
 function render() {
@@ -147,6 +187,8 @@ function render() {
   for (const [id, row] of rows) {
     if (!present.has(id)) { row.tr.remove(); rows.delete(id); }
   }
+  const maxSpeed = Math.max(1, ...tasks.map((t) => t.speed));
+  const body = $("task-body");
   let visible = 0;
   for (const task of tasks) {
     const row = rows.get(task.id) || makeRow(task.id);
@@ -154,9 +196,7 @@ function render() {
     const locked = !online || pending.has(task.id) || pending.has("all");
     row.name.textContent = row.name.title = task.name;
     row.url.textContent = row.url.title = c.url;
-    row.route.textContent = routeText(task);
-    row.route.title = task.connection_host ? `${task.connection_host} → ${task.server_ip}` : "";
-    row.route.hidden = !row.route.textContent;
+    renderMeta(row, task);
     row.state.textContent = STATE_NAMES[task.state] || task.state;
     row.state.className = "state " + task.state;
     row.error.textContent = row.error.title = task.last_error || "";
@@ -165,6 +205,7 @@ function render() {
     row.repeat.textContent = c.repeat === 0 ? "∞" : c.repeat;
     row.speed.textContent = formatRate(task.speed);
     row.speed.classList.toggle("moving", task.speed > 0);
+    row.bar.style.width = `${Math.min(100, task.speed / maxSpeed * 100)}%`;
     row.buttons.start.hidden = task.busy;
     row.buttons.stop.hidden = !task.busy;
     row.buttons.start.disabled = locked;
@@ -173,19 +214,22 @@ function render() {
     row.buttons.delete.disabled = locked || task.busy;
     row.tr.hidden = query !== "" && !`${task.name} ${c.url}`.toLowerCase().includes(query);
     if (!row.tr.hidden) visible++;
+    body.append(row.tr); // keeps DOM order in sync with the server's order
   }
-  // Keep table order in sync with the server's list order.
-  for (const task of tasks) $("task-body").append(rows.get(task.id).tr);
 
   $("empty").hidden = tasks.length > 0;
   $("no-results").hidden = tasks.length === 0 || visible > 0;
-  $("connection").className = "connection " + (online ? "online" : "offline");
-  $("connection").textContent = online ? "已连接" : "连接中断，正在重试";
-  $("total-speed").textContent = formatRate(online && board ? board.speed : 0);
+  $("connection").className = "pill " + (online ? "online" : "offline");
+  $("connection").textContent = online ? "已连接" : "连接中断，重试中";
   $("version").textContent = board ? `v${board.app_version}` : "";
-  $("counts").textContent = board
-    ? `运行 ${board.running} · 排队 ${board.queued} · 并发 ${board.allocated}/${board.max_workers}`
-    : "";
+  $("clock").textContent = board ? `${board.clock} ${board.utc_offset}` : "";
+  $("total-speed").textContent = formatRate(online && board ? board.speed : 0);
+  $("stat-running").textContent = board ? board.running : 0;
+  $("stat-total").textContent = board ? `/ ${tasks.length} 条` : "";
+  $("stat-waiting").textContent = board ? `${board.queued} / ${board.waiting}` : "0 / 0";
+  $("stat-workers").textContent = board ? `${board.allocated} / ${board.max_workers}` : "0 / 256";
+  $("worker-meter").style.width = board ? `${board.allocated / board.max_workers * 100}%` : "0";
+
   const busyAll = !online || pending.has("all");
   $("start-all").disabled = busyAll || !tasks.some((t) => !t.busy);
   $("stop-all").disabled = busyAll || !tasks.some((t) => t.busy);
@@ -195,6 +239,45 @@ function render() {
 }
 
 /* ---------- task form ---------- */
+
+const hourButtons = [];
+for (let h = 0; h < 24; h++) {
+  const button = el("button", "", $("hours-grid"));
+  button.type = "button";
+  button.textContent = h;
+  button.title = `${pad(h)}:00–${pad(h + 1)}:00`;
+  button.addEventListener("click", () => { button.classList.toggle("on"); updateHoursSummary(); });
+  hourButtons.push(button);
+}
+
+function selectedHours() {
+  return hourButtons.flatMap((b, h) => (b.classList.contains("on") ? [h] : []));
+}
+
+function setHours(hours) {
+  hourButtons.forEach((b, h) => b.classList.toggle("on", hours.includes(h)));
+  updateHoursSummary();
+}
+
+function updateHoursSummary() {
+  const limited = $("hours-limit").checked;
+  $("hours-grid").classList.toggle("off", !limited);
+  const hours = selectedHours();
+  $("hours-summary").textContent = !limited ? "全天" : hours.length ? hoursText(hours) : "未选择";
+}
+
+const PRESETS = {
+  all: [...Array(24).keys()],
+  none: [],
+  day: [...Array(16).keys()].map((h) => h + 8),
+  night: [...Array(8).keys()],
+};
+for (const button of document.querySelectorAll("[data-hours]")) {
+  button.addEventListener("click", () => {
+    $("hours-limit").checked = true;
+    setHours(PRESETS[button.dataset.hours]);
+  });
+}
 
 function setInfinite() {
   $("task-repeat").disabled = $("task-infinite").checked;
@@ -207,8 +290,9 @@ function openTaskForm(task = null) {
   $("form-title").textContent = task ? "编辑任务" : "添加任务";
   $("save-task").textContent = task ? "保存" : "添加";
   $("url-note").textContent = task ? "编辑时只能填写一条链接" : "每行一个，每条链接是一个独立任务";
-  $("ip-section").open = false;
-  $("advanced-section").open = false;
+  $("hours-zone").textContent = board ? `（服务器时间 ${board.utc_offset}）` : "";
+  for (const id of ["hours-section", "ip-section", "advanced-section"]) $(id).open = false;
+  setHours([]);
   if (task) {
     const c = task.config;
     $("task-urls").value = c.url;
@@ -222,9 +306,14 @@ function openTaskForm(task = null) {
     $("task-interval").value = c.interval;
     $("task-max").value = c.max_gib;
     $("task-duration").value = +(c.duration / 60).toFixed(4);
+    $("task-keepalive").checked = c.keep_alive;
+    $("hours-limit").checked = c.hours.length > 0;
+    setHours(c.hours);
+    $("hours-section").open = c.hours.length > 0;
     $("ip-section").open = c.server_ips.length > 0;
-    $("advanced-section").open = c.rate_mib > 0 || c.max_gib > 0 || c.duration > 0;
+    $("advanced-section").open = c.rate_mib > 0 || c.max_gib > 0 || c.duration > 0 || c.interval > 0 || !c.keep_alive;
   }
+  updateHoursSummary();
   setInfinite();
   $("task-dialog").showModal();
   $("task-urls").focus();
@@ -235,6 +324,12 @@ async function submitTaskForm(event) {
   const urls = $("task-urls").value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   if (editingId && urls.length !== 1) {
     $("form-error").textContent = "编辑时只能填写一条下载链接";
+    return;
+  }
+  const hours = $("hours-limit").checked ? selectedHours() : [];
+  if ($("hours-limit").checked && hours.length === 0) {
+    $("form-error").textContent = "请至少选择一个运行的小时，或取消“只在选中的小时运行”";
+    $("hours-section").open = true;
     return;
   }
   const number = (id) => Number($(id).value);
@@ -249,6 +344,8 @@ async function submitTaskForm(event) {
     interval: number("task-interval"),
     max_gib: number("task-max"),
     duration: Math.round(number("task-duration") * 60 * 1000) / 1000,
+    keep_alive: $("task-keepalive").checked,
+    hours,
   };
   $("form-fields").disabled = true;
   $("save-task").disabled = true;
@@ -257,7 +354,7 @@ async function submitTaskForm(event) {
     const path = editingId ? `/api/tasks/${encodeURIComponent(editingId)}` : "/api/tasks";
     apply(await api(path, editingId ? "PUT" : "POST", body));
     $("task-dialog").close();
-    toast(editingId ? "任务已保存" : `已添加 ${urls.length} 条任务，开始下载`);
+    toast(editingId ? "任务已保存" : `已添加 ${urls.length} 条任务`);
   } catch (error) {
     $("form-error").textContent = error.message;
   } finally {
@@ -284,13 +381,11 @@ async function submitImport(event) {
   $("import-submit").disabled = true;
   $("import-error").textContent = "";
   try {
-    const text = await file.text();
     const before = board ? board.tasks.length : 0;
-    const data = await api(`/api/import?mode=${mode}`, "POST", text);
+    const data = await api(`/api/import?mode=${mode}`, "POST", await file.text());
     apply(data);
     $("import-dialog").close();
-    const added = mode === "replace" ? data.tasks.length : data.tasks.length - before;
-    toast(`已导入 ${added} 条任务`);
+    toast(`已导入 ${mode === "replace" ? data.tasks.length : data.tasks.length - before} 条任务`);
   } catch (error) {
     $("import-error").textContent = error.message;
   } finally {
@@ -323,6 +418,7 @@ $("stop-all").addEventListener("click", () => act("all", "/api/tasks/stop-all"))
 $("export").addEventListener("click", () => { window.location.href = "/api/export"; });
 $("import").addEventListener("click", openImport);
 $("task-infinite").addEventListener("change", setInfinite);
+$("hours-limit").addEventListener("change", updateHoursSummary);
 $("task-form").addEventListener("submit", submitTaskForm);
 $("import-form").addEventListener("submit", submitImport);
 for (const button of document.querySelectorAll("dialog .cancel")) {

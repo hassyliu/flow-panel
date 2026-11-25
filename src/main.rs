@@ -23,6 +23,7 @@ Flow Panel — 局域网下载任务面板
   --data-dir <目录>   任务配置目录，默认 ./data         (FLOW_PANEL_DATA_DIR)
   --threads <数量>    工作线程数，默认 CPU 核数，最多 4  (FLOW_PANEL_THREADS)
   --ca-file <文件>    额外信任的 CA 证书（PEM）         (FLOW_PANEL_CA_FILE)
+  --utc-offset <小时> 定时所用时区，默认 8（北京时间）   (FLOW_PANEL_UTC_OFFSET)
   --healthcheck       检查本机面板是否正常，用于容器健康检查
   --version           显示版本
   --help              显示帮助
@@ -34,6 +35,7 @@ struct Options {
     data_dir: PathBuf,
     threads: usize,
     ca_file: Option<PathBuf>,
+    utc_offset_minutes: i32,
     healthcheck: bool,
 }
 
@@ -50,6 +52,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
     let mut data_dir = env("FLOW_PANEL_DATA_DIR").unwrap_or_else(|| "data".into());
     let mut threads = env("FLOW_PANEL_THREADS").unwrap_or_else(|| cores.to_string());
     let mut ca_file = env("FLOW_PANEL_CA_FILE");
+    let mut utc_offset = env("FLOW_PANEL_UTC_OFFSET").unwrap_or_else(|| "8".into());
     let mut healthcheck = false;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -64,6 +67,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
             "--data-dir" => data_dir = value()?,
             "--threads" => threads = value()?,
             "--ca-file" => ca_file = Some(value()?),
+            "--utc-offset" => utc_offset = value()?,
             "--healthcheck" => healthcheck = true,
             "--version" | "-V" => return Ok(Command::Print(format!("Flow Panel {}", env!("CARGO_PKG_VERSION")))),
             "--help" | "-h" => return Ok(Command::Print(USAGE.to_owned())),
@@ -72,12 +76,21 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
     }
     let port: u16 = port.trim().parse().map_err(|_| format!("端口无效：{port}"))?;
     let threads: usize = threads.trim().parse().ok().filter(|n| (1..=64).contains(n)).ok_or("线程数应为 1–64")?;
+    let utc_offset_minutes = utc_offset
+        .trim()
+        .trim_start_matches('+')
+        .parse::<f64>()
+        .ok()
+        .filter(|hours| (-12.0..=14.0).contains(hours) && (hours * 4.0).fract() == 0.0)
+        .map(|hours| (hours * 60.0) as i32)
+        .ok_or_else(|| format!("时区无效：{utc_offset}（例如 8、-5、5.5）"))?;
     Ok(Command::Run(Options {
         host,
         port,
         data_dir: PathBuf::from(data_dir),
         threads,
         ca_file: ca_file.map(PathBuf::from),
+        utc_offset_minutes,
         healthcheck,
     }))
 }
@@ -125,6 +138,7 @@ async fn run(options: Options) -> Result<(), String> {
     let tls = tls::client_config(options.ca_file.as_deref())?;
     let engine = engine::Engine::new(tls);
     let manager = tasks::TaskManager::load(engine, options.data_dir.join("tasks.json"))?;
+    manager.set_utc_offset(options.utc_offset_minutes);
     let listener = tokio::net::TcpListener::bind((options.host.as_str(), options.port))
         .await
         .map_err(|e| format!("监听 {}:{} 失败：{e}", options.host, options.port))?;
@@ -143,6 +157,7 @@ async fn run(options: Options) -> Result<(), String> {
         }
     );
     manager.resume();
+    manager.start_clock();
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(http::serve(listener, manager.clone(), shutdown.clone()));
     wait_for_signal().await;
@@ -217,6 +232,9 @@ mod tests {
         let custom = options(&["--port", "9090", "--host=127.0.0.1", "--data-dir", "/data", "--threads", "2"]);
         assert_eq!((custom.port, custom.host.as_str(), custom.threads), (9090, "127.0.0.1", 2));
         assert!(parse_args(["--port", "70000"].iter().map(|s| s.to_string())).is_err());
+        assert_eq!(options(&[]).utc_offset_minutes, 480);
+        assert_eq!(options(&["--utc-offset", "-5.5"]).utc_offset_minutes, -330);
+        assert!(parse_args(["--utc-offset", "15"].iter().map(|s| s.to_string())).is_err());
         assert!(parse_args(["--bogus"].iter().map(|s| s.to_string())).is_err());
         assert!(parse_args(["--port"].iter().map(|s| s.to_string())).is_err());
     }

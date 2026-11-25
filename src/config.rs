@@ -30,6 +30,10 @@ pub struct Settings {
     pub duration: f64,
     /// Server IPs used in order for the URL's own host, empty = normal DNS.
     pub server_ips: Vec<String>,
+    /// Reuse connections between downloads (HTTP keep-alive).
+    pub keep_alive: bool,
+    /// Hours of the day (0–23, panel time zone) in which the task runs; empty = all day.
+    pub hours: Vec<u8>,
 }
 
 impl Default for Settings {
@@ -37,12 +41,14 @@ impl Default for Settings {
         Settings {
             concurrency: 8,
             repeat: 1,
-            interval: 0.2,
+            interval: 0.0,
             timeout: 15.0,
             rate_mib: 0.0,
             max_gib: 0.0,
             duration: 0.0,
             server_ips: Vec::new(),
+            keep_alive: true,
+            hours: Vec::new(),
         }
     }
 }
@@ -140,7 +146,32 @@ fn parse_settings(object: &Map<String, Value>) -> Result<Settings, String> {
         max_gib: number("max_gib", "流量上限", 0.0, 1_000_000.0, d.max_gib, false)?,
         duration: number("duration", "运行时长", 0.0, 31_536_000.0, d.duration, false)?,
         server_ips: parse_server_ips(object.get("server_ips"))?,
+        keep_alive: match object.get("keep_alive") {
+            None | Some(Value::Null) => d.keep_alive,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err("keep_alive 必须为 true 或 false".into()),
+        },
+        hours: parse_hours(object.get("hours"))?,
     })
+}
+
+/// Hours 0–23, sorted and deduplicated. All 24 hours is stored as empty (all day).
+pub fn parse_hours(value: Option<&Value>) -> Result<Vec<u8>, String> {
+    const INVALID: &str = "运行时段必须是 0–23 的小时列表";
+    let items = match value {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(INVALID.into()),
+    };
+    let mut hours = [false; 24];
+    for item in items {
+        let hour = item.as_u64().filter(|h| *h < 24).ok_or(INVALID)?;
+        hours[hour as usize] = true;
+    }
+    if hours.iter().all(|on| *on) {
+        return Ok(Vec::new());
+    }
+    Ok((0..24u8).filter(|h| hours[*h as usize]).collect())
 }
 
 pub fn parse_server_ips(value: Option<&Value>) -> Result<Vec<String>, String> {
@@ -313,6 +344,21 @@ mod tests {
     }
 
     #[test]
+    fn hours_and_keep_alive() {
+        let parsed = request(json!({"urls": ["http://a/"], "hours": [23, 8, 8, 9], "keep_alive": false})).unwrap();
+        assert_eq!(parsed.settings.hours, [8, 9, 23]);
+        assert!(!parsed.settings.keep_alive);
+        let all: Vec<u8> = (0..24).collect();
+        assert!(request(json!({"urls": ["http://a/"], "hours": all})).unwrap().settings.hours.is_empty());
+        let defaults = request(json!({"urls": ["http://a/"]})).unwrap().settings;
+        assert!(defaults.keep_alive && defaults.hours.is_empty() && defaults.interval == 0.0);
+        for bad in [json!([24]), json!([-1]), json!("8-9"), json!([1.5])] {
+            assert!(request(json!({"urls": ["http://a/"], "hours": bad})).is_err(), "accepted {bad}");
+        }
+        assert!(request(json!({"urls": ["http://a/"], "keep_alive": 1})).is_err());
+    }
+
+    #[test]
     fn names() {
         assert_eq!(default_task_name("http://a.test/dir/%E4%B8%AD.bin"), "中.bin");
         assert_eq!(default_task_name("http://a.test/dir/"), "dir");
@@ -329,7 +375,14 @@ mod tests {
     fn stored_config_round_trip() {
         let config = Config {
             url: "http://a.test/file".into(),
-            settings: Settings { repeat: 0, server_ips: vec!["10.0.0.1".into()], max_gib: 2.5, ..Settings::default() },
+            settings: Settings {
+                repeat: 0,
+                server_ips: vec!["10.0.0.1".into()],
+                max_gib: 2.5,
+                keep_alive: false,
+                hours: vec![1, 2],
+                ..Settings::default()
+            },
         };
         let value = serde_json::to_value(&config).unwrap();
         assert_eq!(parse_config(&value).unwrap(), config);
