@@ -45,3 +45,17 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Sync DOCKERHUB.md to the Docker Hub overview. Needs a token with the
+      # Read, Write, Delete scope; a failure here never blocks the release.
+      - name: Fill in the image name
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: sed -i "s#用户名/flow-panel#${HUB_USER}/flow-panel#g" DOCKERHUB.md
+      - uses: peter-evans/dockerhub-description@v5
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/flow-panel
+          short-description: 低配机器友好的局域网下载任务面板：并发、限速、定时、指定 IP，约 3 MB
+          readme-filepath: ./DOCKERHUB.md
