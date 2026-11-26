@@ -816,7 +816,9 @@ mod tests {
     async fn storage_failure_keeps_previous_intent() {
         let path = temp_store("failure");
         let m = TaskManager::load(test_engine(), path.clone()).unwrap();
-        m.import(br#"{"tasks":[{"config":{"url":"http://127.0.0.1:9/"}}]}"#, false).unwrap();
+        // Repeat until stopped, so the run cannot end by itself (and switch the
+        // task off) before the test stops it.
+        m.import(br#"{"tasks":[{"config":{"url":"http://127.0.0.1:9/","repeat":0}}]}"#, false).unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap(); // the rename now fails
         assert!(matches!(m.start("task-1"), Err(TaskError::Storage(_))));
