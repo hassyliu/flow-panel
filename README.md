@@ -1,6 +1,6 @@
 # Flow Panel
 
-局域网下载任务面板：每条链接是一个独立任务，可设置并发、次数、限速，并可指定服务器 IP。下载内容只经过内存，不写入磁盘。
+下载任务面板：每条链接是一个独立任务，可设置并发、次数、限速、运行时段，并可指定服务器 IP。下载内容只经过内存，不写入磁盘。
 
 用 Rust 编写，适合低配机器（例如 Celeron J1900）：
 
@@ -15,7 +15,9 @@
 
 ```sh
 docker run -d --name flow-panel --restart unless-stopped \
-  -p 8089:8089 -v flow-panel-data:/data <用户名>/flow-panel:latest
+  -p 8089:8089 -v flow-panel-data:/data \
+  -e FLOW_PANEL_PASSWORD='换成你的密码' \
+  <用户名>/flow-panel:latest
 ```
 
 或者从源码构建：
@@ -52,6 +54,7 @@ docker run -d -e FLOW_PANEL_PORT=9000 -p 9000:9000 -v flow-panel-data:/data flow
 | `--threads` | `FLOW_PANEL_THREADS` | CPU 核数，最多 4 | 工作线程数 |
 | `--ca-file` | `FLOW_PANEL_CA_FILE` | 无 | 额外信任的 CA 证书（PEM），用于内网私有 CA |
 | `--utc-offset` | `FLOW_PANEL_UTC_OFFSET` | `8` | 运行时段所用的时区（小时，例如 `8`、`-5`、`5.5`） |
+| `--password` | `FLOW_PANEL_PASSWORD` | 无 | 访问密码；不设置则无需登录 |
 | `--healthcheck` | | | 检查本机面板是否正常，用于容器健康检查 |
 
 公共 CA 根证书已内置在程序中，不依赖系统证书。
@@ -61,7 +64,9 @@ docker run -d -e FLOW_PANEL_PORT=9000 -p 9000:9000 -v flow-panel-data:/data flow
 - **添加任务**：每行一个链接，每条链接创建一个独立任务，添加后立即开始下载。
 - **全部开始 / 全部停止**：启动所有未运行的任务，或停止所有任务。
 - **并发预算**：所有运行中任务的并发总和上限为 256；超出时任务显示“排队中”，按列表顺序依次启动，大任务不会被后来的小任务插队。
-- **运行时段**：可选择一天 24 小时中哪些小时运行。到了选中的小时自动开始，其他时间自动暂停，暂停时显示“等待时段”；手动停止后不会再被定时启动。时间按 `--utc-offset` 设置的时区计算（默认北京时间），页面右上角显示当前的服务器时间。
+- **全局定时**：工具栏上的“全局定时”开关。开启后，没有单独设置时段的任务只在选中的小时运行：到点自动开始，其他时间自动暂停（显示“等待时段”）；关闭后这些任务全天运行。点开关旁边的时段文字可以修改时段。
+- **单独设置时段**：在任务的“运行时段”里选择“单独设置这个任务的时段”，这个任务就按自己的时段运行，不受全局定时影响；选“全天”表示始终运行。
+- **选择小时**：点一下切换一个小时；按住鼠标拖动可以连续选择；也可以直接输入范围，例如 `0-7, 22-23`，或 `22-6`（跨过午夜）。手动停止的任务不会被定时启动。时间按 `--utc-offset` 设置的时区计算（默认北京时间），页面右上角显示当前的服务器时间。
 - **复用连接**：默认开启（HTTP Keep-Alive）。多次下载复用同一条连接，省去重复的 TCP 和 TLS 握手，下载小文件时 CPU 开销能降到约四分之一。关闭后每次下载都新建连接。
 - **限速**：按每个任务所有并发的总速率计算。
 - **流量上限 / 运行时长**：达到上限后任务自动停止。
@@ -72,10 +77,10 @@ docker run -d -e FLOW_PANEL_PORT=9000 -p 9000:9000 -v flow-panel-data:/data flow
 
 ### 导出 / 导入
 
-“导出”会下载 `flow-panel-tasks-日期.json`，其中包含每个任务的名称和下载设置。“导入”有两种方式：
+“导出”会下载 `flow-panel-tasks-日期.json`，其中包含全局定时，以及每个任务的名称和下载设置。“导入”有两种方式：
 
-- **追加**：导入的任务加在现有任务之后；
-- **替换**：先删除全部现有任务，要求所有任务都已停止。
+- **追加**：导入的任务加在现有任务之后，全局定时不变；
+- **替换**：先删除全部现有任务（要求所有任务都已停止），全局定时也换成文件里的设置。
 
 导入的任务都处于停止状态，可点击“全部开始”启动。
 
@@ -91,16 +96,32 @@ docker run -d -e FLOW_PANEL_PORT=9000 -p 9000:9000 -v flow-panel-data:/data flow
 | DELETE | `/api/tasks/{id}` | 删除已停止的任务 |
 | POST | `/api/tasks/{id}/start`、`/api/tasks/{id}/stop` | 启动 / 停止单个任务 |
 | POST | `/api/tasks/start-all`、`/api/tasks/stop-all` | 全部开始 / 全部停止 |
+| PUT | `/api/schedule` | 设置全局定时，例如 `{"enabled":true,"hours":[0,1,2,3]}` |
 | GET | `/api/export` | 导出配置 |
 | POST | `/api/import?mode=append\|replace` | 导入配置（请求体为导出文件） |
-| GET | `/healthz` | 健康检查 |
+| POST | `/api/login`、`/api/logout` | 登录（`{"password":"..."}`）/ 退出 |
+| GET | `/healthz` | 健康检查（无需密码） |
+
+设置了访问密码时，脚本用 `Authorization: Bearer <密码>` 调用：
 
 ```sh
 curl -X POST http://127.0.0.1:8089/api/tasks -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer 你的密码' \
   -d '{"urls":"https://example.com/a.bin","concurrency":8,"repeat":0,"server_ips":"10.0.0.1\n10.0.0.2"}'
 ```
 
-面板没有登录功能，只应在内网使用。来自其他网站页面的修改请求（跨站请求）会被拒绝，命令行工具和脚本不受影响。
+## 访问密码
+
+设置 `FLOW_PANEL_PASSWORD`（或 `--password`）后，打开面板需要先输入密码，登录状态保留 30 天，右上角可以“退出”。
+
+- 修改密码后重启，所有已登录的浏览器都需要重新登录。
+- 同一个 IP 连续输错 5 次密码，15 分钟内不能再试。
+- 会话密钥保存在数据目录的 `secret.key`；删除它再重启，也会让所有人重新登录。
+- 不设置密码时，页面右上角会提示“未设置访问密码”，任何能访问端口的人都能操作面板。
+
+**放到公网时**：密码在 HTTP 上是明文传输的，同一网络里的人有可能截获。建议用 Caddy、Nginx 等反向代理加上 HTTPS（代理需要转发 `X-Forwarded-Proto: https`，面板会给登录 Cookie 加上 `Secure`）。另外，面板会让服务器向你填写的链接发起下载，请使用足够长、不易猜到的密码。
+
+来自其他网站页面的修改请求（跨站请求）会被拒绝，命令行工具和脚本不受影响。
 
 ## 发布到 Docker Hub
 

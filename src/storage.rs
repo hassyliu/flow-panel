@@ -3,7 +3,7 @@
 //! Only task definitions and their on/off intent are stored; downloaded data,
 //! counters and speed samples never touch the disk.
 
-use crate::config::{Config, MAX_TASKS, default_task_name, parse_config, parse_name};
+use crate::config::{Config, MAX_TASKS, Schedule, default_task_name, parse_config, parse_name, parse_schedule};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
@@ -34,7 +34,23 @@ pub struct Record<'a> {
 struct TaskFile<'a> {
     version: u64,
     next_id: u64,
+    schedule: &'a Schedule,
     tasks: Vec<Record<'a>>,
+}
+
+#[derive(Default)]
+pub struct Loaded {
+    pub tasks: Vec<StoredTask>,
+    pub next_id: u64,
+    pub schedule: Schedule,
+}
+
+/// A missing schedule (older files) is the default: off.
+fn schedule_of(value: &Value) -> Result<Schedule, String> {
+    match value.get("schedule") {
+        None | Some(Value::Null) => Ok(Schedule::default()),
+        Some(schedule) => parse_schedule(schedule),
+    }
 }
 
 pub fn id_number(id: &str) -> Option<u64> {
@@ -44,10 +60,10 @@ pub fn id_number(id: &str) -> Option<u64> {
 
 /// Read the task file. A missing file is an empty list; a damaged file is an
 /// error so that it is never overwritten.
-pub fn load(path: &Path) -> Result<(Vec<StoredTask>, u64), String> {
+pub fn load(path: &Path) -> Result<Loaded, String> {
     let body = match fs::read(path) {
         Ok(body) => body,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Loaded::default()),
         Err(error) => return Err(format!("读取任务文件 {} 失败：{error}", path.display())),
     };
     let damaged = |reason: String| format!("任务文件 {} 无效（{reason}），原文件未修改", path.display());
@@ -59,6 +75,7 @@ pub fn load(path: &Path) -> Result<(Vec<StoredTask>, u64), String> {
     if items.len() > MAX_TASKS {
         return Err(damaged(format!("超过 {MAX_TASKS} 条任务")));
     }
+    let schedule = schedule_of(&value).map_err(|e| damaged(format!("全局定时：{e}")))?;
     let mut next_id = value.get("next_id").and_then(Value::as_u64).unwrap_or(0);
     let mut tasks: Vec<StoredTask> = Vec::with_capacity(items.len());
     for item in items {
@@ -79,23 +96,25 @@ pub fn load(path: &Path) -> Result<(Vec<StoredTask>, u64), String> {
             config,
         });
     }
-    Ok((tasks, next_id))
+    Ok(Loaded { tasks, next_id, schedule })
 }
 
-pub fn save(path: &Path, tasks: Vec<Record<'_>>, next_id: u64) -> io::Result<()> {
-    let file = TaskFile { version: FILE_VERSION, next_id, tasks };
+pub fn save(path: &Path, tasks: Vec<Record<'_>>, next_id: u64, schedule: &Schedule) -> io::Result<()> {
+    let file = TaskFile { version: FILE_VERSION, next_id, schedule, tasks };
     let mut body = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
     body.push(b'\n');
     write_atomic(path, &body)
 }
 
-/// Portable export: names and download settings only, no IDs or run state.
-pub fn export(tasks: &[Record<'_>], exported_at: f64) -> Vec<u8> {
+/// Portable export: the global schedule plus task names and download
+/// settings; no IDs or run state.
+pub fn export(tasks: &[Record<'_>], schedule: &Schedule, exported_at: f64) -> Vec<u8> {
     let tasks: Vec<Value> = tasks.iter().map(|task| json!({"name": task.name, "config": task.config})).collect();
     let mut body = serde_json::to_vec_pretty(&json!({
         "app": "flow-panel",
         "version": FILE_VERSION,
         "exported_at": exported_at,
+        "schedule": schedule,
         "tasks": tasks,
     }))
     .expect("JSON values always serialize");
@@ -103,8 +122,15 @@ pub fn export(tasks: &[Record<'_>], exported_at: f64) -> Vec<u8> {
     body
 }
 
+#[derive(Debug)]
+pub struct Import {
+    pub tasks: Vec<(String, Config)>,
+    /// Present when the file carries a global schedule.
+    pub schedule: Option<Schedule>,
+}
+
 /// Parse an export (or a task file) into (name, config) pairs.
-pub fn parse_import(body: &[u8]) -> Result<Vec<(String, Config)>, String> {
+pub fn parse_import(body: &[u8]) -> Result<Import, String> {
     let value: Value = serde_json::from_slice(body).map_err(|_| "导入文件不是有效的 JSON")?;
     let items = value.get("tasks").and_then(Value::as_array).ok_or("导入文件缺少任务列表 tasks")?;
     if items.is_empty() {
@@ -113,7 +139,11 @@ pub fn parse_import(body: &[u8]) -> Result<Vec<(String, Config)>, String> {
     if items.len() > MAX_TASKS {
         return Err(format!("导入文件超过 {MAX_TASKS} 条任务"));
     }
-    items
+    let schedule = match value.get("schedule") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(schedule_of(&value).map_err(|e| format!("全局定时：{e}"))?),
+    };
+    let tasks = items
         .iter()
         .enumerate()
         .map(|(index, item)| {
@@ -123,7 +153,8 @@ pub fn parse_import(body: &[u8]) -> Result<Vec<(String, Config)>, String> {
             let name = if name.is_empty() { default_task_name(&config.url) } else { name };
             Ok((name, config))
         })
-        .collect()
+        .collect::<Result<_, String>>()?;
+    Ok(Import { tasks, schedule })
 }
 
 /// Write to a temporary file in the same directory, flush it, then rename over
@@ -177,13 +208,18 @@ mod tests {
         let path = dir.join("tasks.json");
         let config = sample();
         let records = vec![Record { id: "task-3", name: "a", enabled: true, created_at: 1.5, config: &config }];
-        save(&path, records, 7).unwrap();
-        let (tasks, next_id) = load(&path).unwrap();
-        assert_eq!((tasks.len(), next_id, tasks[0].enabled, tasks[0].config.clone()), (1, 7, true, config));
+        let schedule = Schedule { enabled: true, hours: vec![1, 2] };
+        save(&path, records, 7, &schedule).unwrap();
+        let loaded = load(&path).unwrap();
+        let task = &loaded.tasks[0];
+        assert_eq!((loaded.tasks.len(), loaded.next_id, task.enabled, task.config.clone()), (1, 7, true, config));
+        assert_eq!(loaded.schedule, schedule);
         let leftovers: Vec<_> =
             fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name() != "tasks.json").collect();
         assert!(leftovers.is_empty(), "temporary files left behind");
-        assert!(load(&dir.join("missing.json")).unwrap().0.is_empty());
+        assert!(load(&dir.join("missing.json")).unwrap().tasks.is_empty());
+        fs::write(&path, r#"{"version":1,"tasks":[]}"#).unwrap();
+        assert_eq!(load(&path).unwrap().schedule, Schedule::default());
     }
 
     #[test]
@@ -197,6 +233,7 @@ mod tests {
             format!(r#"{{"version":1,"tasks":[{{"id":"task-0","config":{good}}}]}}"#),
             format!(r#"{{"version":1,"tasks":[{{"id":"task-1","config":{good}}},{{"id":"task-1","config":{good}}}]}}"#),
             r#"{"version":1,"tasks":[{"id":"task-1","config":{"url":"ftp://x"}}]}"#.to_owned(),
+            r#"{"version":1,"schedule":{"enabled":true,"hours":[]},"tasks":[]}"#.to_owned(),
         ] {
             fs::write(&path, &body).unwrap();
             assert!(load(&path).is_err(), "accepted {body}");
@@ -207,10 +244,12 @@ mod tests {
     #[test]
     fn export_import_round_trip() {
         let config = sample();
-        let body =
-            export(&[Record { id: "task-1", name: "名字", enabled: true, created_at: 0.0, config: &config }], 1.0);
-        let imported = parse_import(&body).unwrap();
-        assert_eq!(imported, vec![("名字".to_owned(), config)]);
+        let schedule = Schedule { enabled: true, hours: vec![3] };
+        let record = Record { id: "task-1", name: "名字", enabled: true, created_at: 0.0, config: &config };
+        let imported = parse_import(&export(&[record], &schedule, 1.0)).unwrap();
+        assert_eq!(imported.tasks, vec![("名字".to_owned(), config)]);
+        assert_eq!(imported.schedule, Some(schedule));
+        assert_eq!(parse_import(br#"{"tasks":[{"config":{"url":"http://a/"}}]}"#).unwrap().schedule, None);
         assert!(parse_import(b"{}").is_err());
         assert!(parse_import(br#"{"tasks":[]}"#).is_err());
         let err = parse_import(br#"{"tasks":[{"config":{"url":"http://a/"}},{"config":{"url":"bad"}}]}"#).unwrap_err();

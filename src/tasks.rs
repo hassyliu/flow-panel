@@ -1,7 +1,7 @@
 //! Task list: independent tasks, each with its own on/off intent, scheduled
 //! first-in first-out under a global concurrency budget.
 
-use crate::config::{Config, MAX_TASKS, TaskRequest, batch_names, default_task_name};
+use crate::config::{Config, MAX_TASKS, Schedule, TaskRequest, batch_names, default_task_name, runs_at};
 use crate::engine::{Engine, Phase, Run};
 use crate::storage::{self, Record};
 use serde::Serialize;
@@ -58,9 +58,8 @@ impl Task {
         self.enabled || self.run.is_some()
     }
 
-    fn in_hours(&self, hour: u8) -> bool {
-        let hours = &self.config.settings.hours;
-        hours.is_empty() || hours.contains(&hour)
+    fn in_hours(&self, hour: u8, global: &Schedule) -> bool {
+        runs_at(&self.config.settings.hours, global, hour)
     }
 
     fn record(&self) -> Record<'_> {
@@ -109,11 +108,16 @@ pub struct Board {
     /// Panel clock used for schedules, e.g. "14:05", and its zone, e.g. "UTC+8".
     pub clock: String,
     pub utc_offset: String,
+    /// Hours for tasks without their own.
+    pub schedule: Schedule,
+    /// An access password is set (filled in by the web server).
+    pub auth: bool,
 }
 
 struct Inner {
     tasks: Vec<Task>,
     next_id: u64,
+    schedule: Schedule,
     version: u64,
     closing: bool,
 }
@@ -139,23 +143,30 @@ impl TaskManager {
     /// In-memory manager without persistence.
     #[cfg(test)]
     pub fn memory(engine: Arc<Engine>) -> Arc<TaskManager> {
-        Self::build(engine, None, Vec::new(), 0)
+        Self::build(engine, None, Vec::new(), 0, Schedule::default())
     }
 
     /// Load tasks from `path` (created on the first save).
     pub fn load(engine: Arc<Engine>, path: PathBuf) -> Result<Arc<TaskManager>, String> {
-        let (stored, next_id) = storage::load(&path)?;
-        let tasks = stored.into_iter().map(|t| Task::new(t.id, t.name, t.config, t.created_at, t.enabled)).collect();
-        Ok(Self::build(engine, Some(path), tasks, next_id))
+        let loaded = storage::load(&path)?;
+        let tasks =
+            loaded.tasks.into_iter().map(|t| Task::new(t.id, t.name, t.config, t.created_at, t.enabled)).collect();
+        Ok(Self::build(engine, Some(path), tasks, loaded.next_id, loaded.schedule))
     }
 
-    fn build(engine: Arc<Engine>, store: Option<PathBuf>, tasks: Vec<Task>, next_id: u64) -> Arc<TaskManager> {
+    fn build(
+        engine: Arc<Engine>,
+        store: Option<PathBuf>,
+        tasks: Vec<Task>,
+        next_id: u64,
+        schedule: Schedule,
+    ) -> Arc<TaskManager> {
         let instance = format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos());
         Arc::new(TaskManager {
             engine,
             store,
             instance,
-            inner: Mutex::new(Inner { tasks, next_id, version: 0, closing: false }),
+            inner: Mutex::new(Inner { tasks, next_id, schedule, version: 0, closing: false }),
             watchers: TaskTracker::new(),
             utc_offset: AtomicI32::new(8 * 60),
             #[cfg(test)]
@@ -203,6 +214,11 @@ impl TaskManager {
 
     pub fn tick(self: &Arc<Self>) {
         let mut inner = self.lock();
+        self.apply_hours(&mut inner);
+    }
+
+    /// Pause running tasks outside their hours, then start what may run now.
+    fn apply_hours(self: &Arc<Self>, inner: &mut Inner) {
         if inner.closing {
             return;
         }
@@ -210,13 +226,23 @@ impl TaskManager {
         for task in inner.tasks.iter_mut() {
             if let Some(run) = &task.run
                 && task.enabled
-                && !task.in_hours(hour)
+                && !task.in_hours(hour, &inner.schedule)
             {
                 task.paused = true;
                 run.stop("不在运行时段");
             }
         }
-        self.schedule(&mut inner);
+        self.schedule(inner);
+    }
+
+    /// Replace the global schedule and apply it right away.
+    pub fn set_schedule(self: &Arc<Self>, schedule: Schedule) -> Result<(), TaskError> {
+        let mut inner = self.lock();
+        Self::open(&inner)?;
+        self.save(&inner.tasks, inner.next_id, &schedule)?;
+        inner.schedule = schedule;
+        self.apply_hours(&mut inner);
+        Ok(())
     }
 
     pub fn data_file(&self) -> Option<&PathBuf> {
@@ -232,9 +258,9 @@ impl TaskManager {
     }
 
     /// Persist a candidate task list. Callers commit to memory only on success.
-    fn save(&self, tasks: &[Task], next_id: u64) -> Result<(), TaskError> {
+    fn save(&self, tasks: &[Task], next_id: u64, schedule: &Schedule) -> Result<(), TaskError> {
         let Some(path) = &self.store else { return Ok(()) };
-        storage::save(path, tasks.iter().map(Task::record).collect(), next_id)
+        storage::save(path, tasks.iter().map(Task::record).collect(), next_id, schedule)
             .map_err(|e| TaskError::Storage(e.to_string()))
     }
 
@@ -256,7 +282,7 @@ impl TaskManager {
         let mut allocated: u32 =
             inner.tasks.iter().filter(|t| t.run.is_some()).map(|t| t.config.settings.concurrency).sum();
         for task in inner.tasks.iter_mut() {
-            if !task.enabled || task.run.is_some() || !task.in_hours(hour) {
+            if !task.enabled || task.run.is_some() || !task.in_hours(hour, &inner.schedule) {
                 continue;
             }
             let needed = task.config.settings.concurrency;
@@ -288,7 +314,7 @@ impl TaskManager {
         let finished = (!inner.closing && !paused) || run.phase() == Phase::Completed;
         if inner.tasks[index].enabled && finished {
             inner.tasks[index].enabled = false;
-            if let Err(error) = self.save(&inner.tasks, inner.next_id) {
+            if let Err(error) = self.save(&inner.tasks, inner.next_id, &inner.schedule) {
                 eprintln!("{error}");
                 inner.tasks[index].error = error.to_string();
             }
@@ -321,7 +347,7 @@ impl TaskManager {
             tasks.push(Task::new(id.clone(), name, config, created, true));
             ids.push(id);
         }
-        self.save(&tasks, next_id)?;
+        self.save(&tasks, next_id, &inner.schedule)?;
         inner.tasks = tasks;
         inner.next_id = next_id;
         self.schedule(&mut inner);
@@ -345,7 +371,7 @@ impl TaskManager {
             Task::new(task.id.clone(), name, Config { url, settings: request.settings }, task.created_at, false);
         let mut tasks = inner.tasks.clone();
         tasks[index] = updated;
-        self.save(&tasks, inner.next_id)?;
+        self.save(&tasks, inner.next_id, &inner.schedule)?;
         inner.tasks = tasks;
         Ok(())
     }
@@ -359,7 +385,7 @@ impl TaskManager {
         }
         let mut tasks = inner.tasks.clone();
         tasks.remove(index);
-        self.save(&tasks, inner.next_id)?;
+        self.save(&tasks, inner.next_id, &inner.schedule)?;
         inner.tasks = tasks;
         Ok(())
     }
@@ -384,7 +410,7 @@ impl TaskManager {
         for &index in &targets {
             inner.tasks[index].enabled = true;
         }
-        if let Err(error) = self.save(&inner.tasks, inner.next_id) {
+        if let Err(error) = self.save(&inner.tasks, inner.next_id, &inner.schedule) {
             for &index in &targets {
                 inner.tasks[index].enabled = false;
             }
@@ -410,7 +436,7 @@ impl TaskManager {
             for &index in &changed {
                 inner.tasks[index].enabled = false;
             }
-            if let Err(error) = self.save(&inner.tasks, inner.next_id) {
+            if let Err(error) = self.save(&inner.tasks, inner.next_id, &inner.schedule) {
                 for &index in &changed {
                     inner.tasks[index].enabled = true;
                 }
@@ -447,13 +473,14 @@ impl TaskManager {
     pub fn export(&self) -> Vec<u8> {
         let inner = self.lock();
         let records: Vec<Record<'_>> = inner.tasks.iter().map(Task::record).collect();
-        storage::export(&records, now())
+        storage::export(&records, &inner.schedule, now())
     }
 
     /// Import tasks from an export file. Imported tasks are stopped. With
-    /// `replace`, every existing task is removed first (all must be stopped).
+    /// `replace`, every existing task is removed first (all must be stopped)
+    /// and the file's global schedule, if any, replaces the current one.
     pub fn import(self: &Arc<Self>, body: &[u8], replace: bool) -> Result<usize, TaskError> {
-        let imported = storage::parse_import(body).map_err(TaskError::Invalid)?;
+        let storage::Import { tasks: imported, schedule } = storage::parse_import(body).map_err(TaskError::Invalid)?;
         let mut inner = self.lock();
         Self::open(&inner)?;
         if replace && inner.tasks.iter().any(Task::busy) {
@@ -471,9 +498,11 @@ impl TaskManager {
             next_id += 1;
             tasks.push(Task::new(format!("task-{next_id}"), name, config, created, false));
         }
-        self.save(&tasks, next_id)?;
+        let schedule = schedule.filter(|_| replace).unwrap_or_else(|| inner.schedule.clone());
+        self.save(&tasks, next_id, &schedule)?;
         inner.tasks = tasks;
         inner.next_id = next_id;
+        inner.schedule = schedule;
         Ok(count)
     }
 
@@ -495,6 +524,8 @@ impl TaskManager {
             waiting: 0,
             clock: String::new(),
             utc_offset: String::new(),
+            schedule: inner.schedule.clone(),
+            auth: false,
         };
         let minutes = self.local_minutes();
         let offset = self.utc_offset.load(Ordering::Relaxed);
@@ -505,7 +536,7 @@ impl TaskManager {
         };
         let hour = self.hour();
         for task in &inner.tasks {
-            let view = view(task, hour);
+            let view = view(task, hour, &inner.schedule);
             board.speed += view.speed;
             board.active += view.active;
             match view.state {
@@ -538,7 +569,7 @@ impl TaskManager {
     }
 }
 
-fn view(task: &Task, hour: u8) -> TaskView {
+fn view(task: &Task, hour: u8, global: &Schedule) -> TaskView {
     let mut view = TaskView {
         id: task.id.clone(),
         name: task.name.clone(),
@@ -567,7 +598,7 @@ fn view(task: &Task, hour: u8) -> TaskView {
     }
     if task.enabled && task.run.is_none() {
         // Waiting for capacity, or for the task's hours to begin.
-        view.state = if task.in_hours(hour) { "queued" } else { "waiting" };
+        view.state = if task.in_hours(hour, global) { "queued" } else { "waiting" };
         view.speed = 0.0;
     }
     if !task.error.is_empty() {
@@ -714,6 +745,41 @@ mod tests {
         m.set_hour(12);
         m.tick();
         assert_eq!(state(&m, &ids[0]), ("stopped", false), "a stopped task was started by its schedule");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_schedule_applies_to_tasks_without_hours() {
+        let o = origin("127.0.0.1:0", |p, _| default_reply(p)).await;
+        let m = TaskManager::memory(test_engine());
+        m.set_hour(10);
+        let url = |q: &str| format!("http://127.0.0.1:{}/slow?{q}", o.port);
+        let all_day: Vec<u8> = (0..24).collect();
+        let follow = m.add(request(&[url("a")], json!({"repeat": 0, "concurrency": 1}))).unwrap();
+        let own = m.add(request(&[url("b")], json!({"repeat": 0, "concurrency": 1, "hours": all_day}))).unwrap();
+        assert_eq!(state(&m, &follow[0]).0, "running");
+        m.set_schedule(Schedule { enabled: true, hours: vec![22, 23] }).unwrap();
+        eventually("follower paused", || state(&m, &follow[0]) == ("waiting", true)).await;
+        assert_eq!(state(&m, &own[0]).0, "running", "a task with its own hours followed the global schedule");
+        m.set_hour(22);
+        m.tick();
+        assert_eq!(state(&m, &follow[0]).0, "running");
+        m.set_hour(10);
+        m.tick();
+        eventually("paused again", || state(&m, &follow[0]) == ("waiting", true)).await;
+        // Switching the global schedule off starts the follower at once.
+        m.set_schedule(Schedule { enabled: false, hours: vec![22, 23] }).unwrap();
+        assert_eq!(state(&m, &follow[0]).0, "running");
+
+        // The schedule travels with an export and is restored by a replace import.
+        m.set_schedule(Schedule { enabled: true, hours: vec![1] }).unwrap();
+        let exported = m.export();
+        m.stop_all().unwrap();
+        eventually("stopped", || m.board().tasks.iter().all(|t| !t.busy)).await;
+        m.set_schedule(Schedule::default()).unwrap();
+        m.import(&exported, false).unwrap();
+        assert!(!m.board().schedule.enabled, "an append import changed the global schedule");
+        m.import(&exported, true).unwrap();
+        assert_eq!(m.board().schedule, Schedule { enabled: true, hours: vec![1] });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

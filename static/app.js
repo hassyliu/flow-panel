@@ -25,15 +25,43 @@ function formatRate(value) {
 
 const pad = (n) => String(n).padStart(2, "0");
 
-/** [8,9,10,20] -> "08:00–11:00, 20:00–21:00" */
-function hoursText(hours) {
-  if (!hours || hours.length === 0) return "全天";
+/** [0,1,2,8,9] -> [[0,2],[8,9]] */
+function hourRanges(hours) {
   const ranges = [];
-  for (const h of hours) {
+  for (const h of [...hours].sort((a, b) => a - b)) {
     const last = ranges[ranges.length - 1];
     if (last && last[1] === h - 1) last[1] = h; else ranges.push([h, h]);
   }
-  return ranges.map(([a, b]) => `${pad(a)}:00–${pad(b + 1)}:00`).join(", ");
+  return ranges;
+}
+
+/** [8,9,10,20] -> "08:00–11:00, 20:00–21:00" */
+function hoursText(hours) {
+  if (!hours || hours.length === 0) return "未选择";
+  if (hours.length === 24) return "全天";
+  return hourRanges(hours).map(([a, b]) => `${pad(a)}:00–${pad(b + 1)}:00`).join(", ");
+}
+
+/** [0..7,22,23] -> "0-7, 22-23" (hour numbers, end included) */
+function rangesText(hours) {
+  return hourRanges(hours).map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(", ");
+}
+
+/** "0-7, 22-23" or "22-6" (through midnight) -> hours, or null when invalid. */
+function parseRanges(text) {
+  const set = new Set();
+  for (const part of text.split(/[,，、;；\s]+/).filter(Boolean)) {
+    const match = /^(\d{1,2})(?:[-–~～至到](\d{1,2}))?$/.exec(part);
+    if (!match) return null;
+    const a = Number(match[1]);
+    const b = match[2] === undefined ? a : Number(match[2]);
+    if (a > 23 || b > 23) return null;
+    for (let h = a; ; h = (h + 1) % 24) {
+      set.add(h);
+      if (h === b) break;
+    }
+  }
+  return [...set].sort((x, y) => x - y);
 }
 
 /** 24-segment gradient: selected hours in the accent colour. */
@@ -69,6 +97,10 @@ async function api(path, method = "GET", body) {
     }
     const response = await fetch(path, options);
     const data = await response.json().catch(() => ({}));
+    if (response.status === 401) {
+      window.location.href = "/"; // signed out or the password changed: back to the login page
+      throw new Error("请重新登录");
+    }
     if (!response.ok) throw new Error(data.error || `请求失败（${response.status}）`);
     return data;
   } catch (error) {
@@ -162,7 +194,8 @@ function renderMeta(row, task) {
   else if (ips.length) chips.push([ips.length === 1 ? `指定 ${ips[0]}` : `${ips.length} 个 IP 轮询`, ""]);
   if (task.tls) chips.push([task.tls, "协商到的 TLS 版本和加密套件"]);
   if (!c.keep_alive) chips.push(["不复用连接", ""]);
-  const key = JSON.stringify([chips, c.hours]);
+  const global = board.schedule.enabled && c.hours.length === 0 ? board.schedule.hours : null;
+  const key = JSON.stringify([chips, c.hours, global]);
   if (row.metaKey === key) return; // avoid rebuilding unchanged chips every second
   row.metaKey = key;
   row.meta.replaceChildren();
@@ -171,11 +204,13 @@ function renderMeta(row, task) {
     chip.textContent = text;
     if (title) chip.title = title;
   }
-  if (c.hours && c.hours.length) {
-    const chip = el("span", "chip hours", row.meta);
+  const hours = c.hours.length ? c.hours : global;
+  if (hours && hours.length < 24) {
+    const chip = el("span", global ? "chip hours follow" : "chip hours", row.meta);
+    chip.title = global ? "跟随全局定时" : "这个任务单独设置的时段";
     const strip = el("span", "strip", chip);
-    strip.style.background = hoursStrip(c.hours);
-    chip.append(hoursText(c.hours));
+    strip.style.background = hoursStrip(hours);
+    chip.append((global ? "全局 " : "") + hoursText(hours));
   }
   row.meta.hidden = row.meta.childElementCount === 0;
 }
@@ -233,51 +268,168 @@ function render() {
   const busyAll = !online || pending.has("all");
   $("start-all").disabled = busyAll || !tasks.some((t) => !t.busy);
   $("stop-all").disabled = busyAll || !tasks.some((t) => t.busy);
+  const schedule = board ? board.schedule : { enabled: false, hours: [] };
+  $("schedule-toggle").checked = schedule.enabled;
+  $("schedule-toggle").disabled = !online || pending.has("schedule");
+  $("schedule-edit").textContent = schedule.enabled ? hoursText(schedule.hours) : "设置时段";
+  $("schedule-edit").disabled = !online;
+  $("no-password").hidden = !board || board.auth;
+  $("logout").hidden = !board || !board.auth;
   $("add-task").disabled = !online;
   $("import").disabled = !online;
   $("export").disabled = !online || tasks.length === 0;
 }
 
+/* ---------- hour picker ---------- */
+
+const PRESETS = [
+  ["全天", () => [...Array(24).keys()]],
+  ["白天 8–23", () => [...Array(16).keys()].map((h) => h + 8)],
+  ["夜间 0–7", () => [...Array(8).keys()]],
+  ["反选", (hours) => [...Array(24).keys()].filter((h) => !hours.includes(h))],
+  ["清空", () => []],
+];
+const NIGHT = PRESETS[2][1];
+
+/** 24 hour buttons (click, or press and drag to paint), a range box and presets. */
+function hourPicker(root, onChange) {
+  const grid = el("div", "hours", root);
+  grid.setAttribute("aria-label", "选择运行的小时");
+  const buttons = [];
+  for (let h = 0; h < 24; h++) {
+    const button = el("button", "", grid);
+    button.type = "button";
+    button.textContent = h;
+    button.title = `${pad(h)}:00–${pad(h + 1)}:00`;
+    buttons.push(button);
+  }
+  const tools = el("div", "picker-tools", root);
+  const text = el("input", "", tools);
+  text.placeholder = "输入范围，例如 0-7, 22-23";
+  text.title = "小时范围，含首尾；22-6 表示晚上 10 点到第二天早上 7 点";
+  text.setAttribute("aria-label", "按小时范围输入运行时段");
+
+  const get = () => buttons.flatMap((b, h) => (b.classList.contains("on") ? [h] : []));
+  const changed = () => {
+    text.value = rangesText(get());
+    text.classList.remove("bad");
+    onChange();
+  };
+  const set = (hours) => {
+    buttons.forEach((b, h) => b.classList.toggle("on", hours.includes(h)));
+    changed();
+  };
+  for (const [label, pick] of PRESETS) {
+    const button = el("button", "", tools);
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", () => set(pick(get())));
+  }
+
+  // Press on an hour and drag across others to paint them all the same way.
+  // Every hour between the previous and the current position is painted, so a
+  // quick drag that skips over buttons still selects a continuous range.
+  let paint = null;
+  let last = 0;
+  grid.addEventListener("pointerdown", (event) => {
+    const button = event.target.closest("button");
+    if (!button || event.button !== 0) return;
+    event.preventDefault();
+    paint = !button.classList.contains("on");
+    last = buttons.indexOf(button);
+    button.classList.toggle("on", paint);
+    changed();
+  });
+  grid.addEventListener("pointermove", (event) => {
+    if (paint === null) return;
+    const target = document.elementFromPoint(event.clientX, event.clientY);
+    const hour = buttons.indexOf(target);
+    if (hour < 0 || hour === last) return;
+    const step = hour > last ? 1 : -1;
+    for (let h = last + step; ; h += step) {
+      buttons[h].classList.toggle("on", paint);
+      if (h === hour) break;
+    }
+    last = hour;
+    changed();
+  });
+  const end = () => { paint = null; };
+  window.addEventListener("pointerup", end);
+  window.addEventListener("pointercancel", end);
+  // Enter / Space on a focused hour produces a click without a pointer press.
+  grid.addEventListener("click", (event) => {
+    const button = event.target.closest("button");
+    if (!button || event.detail !== 0) return;
+    button.classList.toggle("on");
+    changed();
+  });
+  text.addEventListener("change", () => {
+    const hours = parseRanges(text.value);
+    if (hours === null) text.classList.add("bad"); else set(hours);
+  });
+
+  return { get, set, enable: (on) => root.classList.toggle("off", !on) };
+}
+
+/* ---------- global schedule ---------- */
+
+const schedulePicker = hourPicker($("schedule-picker"), () => {});
+
+function openSchedule(enable = null) {
+  const schedule = board.schedule;
+  $("schedule-error").textContent = "";
+  $("schedule-zone").textContent = `服务器时间 ${board.clock} ${board.utc_offset}`;
+  $("schedule-enabled").checked = enable ?? schedule.enabled;
+  schedulePicker.set(schedule.hours.length ? schedule.hours : NIGHT());
+  $("schedule-dialog").showModal();
+}
+
+async function submitSchedule(event) {
+  event.preventDefault();
+  const body = { enabled: $("schedule-enabled").checked, hours: schedulePicker.get() };
+  if (body.enabled && body.hours.length === 0) {
+    $("schedule-error").textContent = "请至少选择一个小时，或关闭全局定时";
+    return;
+  }
+  $("schedule-fields").disabled = true;
+  $("schedule-save").disabled = true;
+  $("schedule-error").textContent = "";
+  try {
+    apply(await api("/api/schedule", "PUT", body));
+    $("schedule-dialog").close();
+    toast(body.enabled ? `全局定时已开启：${hoursText(body.hours)}` : "全局定时已关闭");
+  } catch (error) {
+    $("schedule-error").textContent = error.message;
+  } finally {
+    $("schedule-fields").disabled = false;
+    $("schedule-save").disabled = false;
+  }
+}
+
+function toggleSchedule() {
+  const enabled = $("schedule-toggle").checked;
+  const hours = board.schedule.hours;
+  $("schedule-toggle").checked = board.schedule.enabled; // the server's reply decides
+  if (enabled && hours.length === 0) openSchedule(true);
+  else act("schedule", "/api/schedule", "PUT", { enabled, hours });
+}
+
 /* ---------- task form ---------- */
 
-const hourButtons = [];
-for (let h = 0; h < 24; h++) {
-  const button = el("button", "", $("hours-grid"));
-  button.type = "button";
-  button.textContent = h;
-  button.title = `${pad(h)}:00–${pad(h + 1)}:00`;
-  button.addEventListener("click", () => { button.classList.toggle("on"); updateHoursSummary(); });
-  hourButtons.push(button);
-}
-
-function selectedHours() {
-  return hourButtons.flatMap((b, h) => (b.classList.contains("on") ? [h] : []));
-}
-
-function setHours(hours) {
-  hourButtons.forEach((b, h) => b.classList.toggle("on", hours.includes(h)));
-  updateHoursSummary();
+function hoursMode() {
+  return document.querySelector('input[name="hours-mode"]:checked').value;
 }
 
 function updateHoursSummary() {
-  const limited = $("hours-limit").checked;
-  $("hours-grid").classList.toggle("off", !limited);
-  const hours = selectedHours();
-  $("hours-summary").textContent = !limited ? "全天" : hours.length ? hoursText(hours) : "未选择";
+  const custom = hoursMode() === "custom";
+  taskPicker.enable(custom);
+  const schedule = board ? board.schedule : { enabled: false, hours: [] };
+  const global = schedule.enabled ? hoursText(schedule.hours) : "未开启，全天运行";
+  $("global-note").textContent = `当前：${global}`;
+  $("hours-summary").textContent = custom ? hoursText(taskPicker.get()) : `跟随全局定时（${global}）`;
 }
 
-const PRESETS = {
-  all: [...Array(24).keys()],
-  none: [],
-  day: [...Array(16).keys()].map((h) => h + 8),
-  night: [...Array(8).keys()],
-};
-for (const button of document.querySelectorAll("[data-hours]")) {
-  button.addEventListener("click", () => {
-    $("hours-limit").checked = true;
-    setHours(PRESETS[button.dataset.hours]);
-  });
-}
+const taskPicker = hourPicker($("task-picker"), () => updateHoursSummary());
 
 function setInfinite() {
   $("task-repeat").disabled = $("task-infinite").checked;
@@ -290,9 +442,8 @@ function openTaskForm(task = null) {
   $("form-title").textContent = task ? "编辑任务" : "添加任务";
   $("save-task").textContent = task ? "保存" : "添加";
   $("url-note").textContent = task ? "编辑时只能填写一条链接" : "每行一个，每条链接是一个独立任务";
-  $("hours-zone").textContent = board ? `（服务器时间 ${board.utc_offset}）` : "";
   for (const id of ["hours-section", "ip-section", "advanced-section"]) $(id).open = false;
-  setHours([]);
+  taskPicker.set(board && board.schedule.hours.length ? board.schedule.hours : NIGHT());
   if (task) {
     const c = task.config;
     $("task-urls").value = c.url;
@@ -307,8 +458,10 @@ function openTaskForm(task = null) {
     $("task-max").value = c.max_gib;
     $("task-duration").value = +(c.duration / 60).toFixed(4);
     $("task-keepalive").checked = c.keep_alive;
-    $("hours-limit").checked = c.hours.length > 0;
-    setHours(c.hours);
+    if (c.hours.length) {
+      document.querySelector('input[name="hours-mode"][value="custom"]').checked = true;
+      taskPicker.set(c.hours);
+    }
     $("hours-section").open = c.hours.length > 0;
     $("ip-section").open = c.server_ips.length > 0;
     $("advanced-section").open = c.rate_mib > 0 || c.max_gib > 0 || c.duration > 0 || c.interval > 0 || !c.keep_alive;
@@ -326,9 +479,10 @@ async function submitTaskForm(event) {
     $("form-error").textContent = "编辑时只能填写一条下载链接";
     return;
   }
-  const hours = $("hours-limit").checked ? selectedHours() : [];
-  if ($("hours-limit").checked && hours.length === 0) {
-    $("form-error").textContent = "请至少选择一个运行的小时，或取消“只在选中的小时运行”";
+  const custom = hoursMode() === "custom";
+  const hours = custom ? taskPicker.get() : [];
+  if (custom && hours.length === 0) {
+    $("form-error").textContent = "请至少选择一个运行的小时，或改为跟随全局定时";
     $("hours-section").open = true;
     return;
   }
@@ -418,7 +572,16 @@ $("stop-all").addEventListener("click", () => act("all", "/api/tasks/stop-all"))
 $("export").addEventListener("click", () => { window.location.href = "/api/export"; });
 $("import").addEventListener("click", openImport);
 $("task-infinite").addEventListener("change", setInfinite);
-$("hours-limit").addEventListener("change", updateHoursSummary);
+for (const radio of document.querySelectorAll('input[name="hours-mode"]')) {
+  radio.addEventListener("change", updateHoursSummary);
+}
+$("schedule-toggle").addEventListener("change", toggleSchedule);
+$("schedule-edit").addEventListener("click", () => openSchedule());
+$("schedule-form").addEventListener("submit", submitSchedule);
+$("logout").addEventListener("click", async () => {
+  await fetch("/api/logout", { method: "POST" }).catch(() => {});
+  window.location.href = "/";
+});
 $("task-form").addEventListener("submit", submitTaskForm);
 $("import-form").addEventListener("submit", submitImport);
 for (const button of document.querySelectorAll("dialog .cancel")) {

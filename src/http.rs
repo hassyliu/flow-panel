@@ -1,6 +1,7 @@
 //! Panel web server: embedded page and JSON API.
 
-use crate::config::parse_request;
+use crate::auth::{Auth, Login};
+use crate::config::{parse_request, parse_schedule};
 use crate::tasks::{TaskError, TaskManager};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -12,12 +13,14 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Serialize;
 use serde_json::json;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 const INDEX: &str = include_str!("../static/index.html");
+const LOGIN: &str = include_str!("../static/login.html");
 const SCRIPT: &str = include_str!("../static/app.js");
 const STYLE: &str = include_str!("../static/style.css");
 const ICON: &str = include_str!("../static/favicon.svg");
@@ -27,12 +30,12 @@ const IMPORT_LIMIT: usize = 16 * 1024 * 1024;
 
 type Reply = Response<Full<Bytes>>;
 
-pub async fn serve(listener: TcpListener, manager: Arc<TaskManager>, shutdown: CancellationToken) {
+pub async fn serve(listener: TcpListener, manager: Arc<TaskManager>, auth: Arc<Auth>, shutdown: CancellationToken) {
     loop {
-        let stream = tokio::select! {
+        let (stream, peer) = tokio::select! {
             _ = shutdown.cancelled() => return,
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
+                Ok(accepted) => accepted,
                 Err(error) => {
                     eprintln!("接受连接失败：{error}");
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -40,11 +43,12 @@ pub async fn serve(listener: TcpListener, manager: Arc<TaskManager>, shutdown: C
                 }
             },
         };
-        let manager = manager.clone();
+        let (manager, auth) = (manager.clone(), auth.clone());
+        let ip = peer.ip().to_canonical();
         tokio::spawn(async move {
             let service = service_fn(move |request| {
-                let manager = manager.clone();
-                async move { Ok::<_, Infallible>(handle(request, &manager).await) }
+                let (manager, auth) = (manager.clone(), auth.clone());
+                async move { Ok::<_, Infallible>(handle(request, &manager, &auth, ip).await) }
             });
             let mut builder = hyper::server::conn::http1::Builder::new();
             builder.timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(10));
@@ -71,6 +75,19 @@ fn json_reply(status: StatusCode, value: &impl Serialize) -> Reply {
 
 fn error_reply(status: StatusCode, message: impl Into<String>) -> Reply {
     json_reply(status, &json!({ "error": message.into() }))
+}
+
+fn board_reply(manager: &TaskManager, auth: &Auth) -> Reply {
+    let mut board = manager.board();
+    board.auth = auth.enabled();
+    json_reply(StatusCode::OK, &board)
+}
+
+fn with_cookie(mut reply: Reply, cookie: &str) -> Reply {
+    if let Ok(value) = HeaderValue::from_str(cookie) {
+        reply.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    reply
 }
 
 fn task_error(error: TaskError) -> Reply {
@@ -124,20 +141,29 @@ fn timestamp(seconds: u64) -> String {
     format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rest / 3600, rest % 3600 / 60, rest % 60)
 }
 
-async fn handle(request: Request<Incoming>, manager: &Arc<TaskManager>) -> Reply {
+async fn handle(request: Request<Incoming>, manager: &Arc<TaskManager>, auth: &Auth, ip: IpAddr) -> Reply {
     let (parts, body) = request.into_parts();
     let method = parts.method.as_str();
     let path = parts.uri.path();
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let public =
+        matches!(segments.as_slice(), ["style.css"] | ["favicon.svg"] | ["healthz"] | ["api", "login" | "logout"]);
+    let signed_in = auth.allowed(&parts.headers, ip);
 
     if matches!(method, "GET" | "HEAD") {
+        if !signed_in && !public {
+            return match segments.as_slice() {
+                [""] => respond(StatusCode::OK, "text/html; charset=utf-8", LOGIN),
+                _ => error_reply(StatusCode::UNAUTHORIZED, "请先登录"),
+            };
+        }
         return match segments.as_slice() {
             [""] => respond(StatusCode::OK, "text/html; charset=utf-8", INDEX),
             ["app.js"] => respond(StatusCode::OK, "text/javascript; charset=utf-8", SCRIPT),
             ["style.css"] => respond(StatusCode::OK, "text/css; charset=utf-8", STYLE),
             ["favicon.svg"] => respond(StatusCode::OK, "image/svg+xml", ICON),
             ["healthz"] => json_reply(StatusCode::OK, &json!({"ok": true})),
-            ["api", "state"] => json_reply(StatusCode::OK, &manager.board()),
+            ["api", "state"] => board_reply(manager, auth),
             ["api", "export"] => {
                 let mut reply = respond(StatusCode::OK, "application/json; charset=utf-8", manager.export());
                 let name =
@@ -156,17 +182,29 @@ async fn handle(request: Request<Incoming>, manager: &Arc<TaskManager>) -> Reply
     if cross_site(&parts.headers) {
         return error_reply(StatusCode::FORBIDDEN, "已拒绝跨站请求");
     }
+    if method == "POST" && segments.as_slice() == ["api", "logout"] {
+        return with_cookie(json_reply(StatusCode::OK, &json!({"ok": true})), &Auth::logout_cookie());
+    }
+    if !signed_in && !public {
+        return error_reply(StatusCode::UNAUTHORIZED, "请先登录");
+    }
     let is_import = method == "POST" && segments.as_slice() == ["api", "import"];
     let body = match read_body(body, if is_import { IMPORT_LIMIT } else { BODY_LIMIT }).await {
         Ok(body) => body,
         Err(reply) => return reply,
     };
     let result = match (method, segments.as_slice()) {
+        ("POST", ["api", "login"]) => return login(&parts.headers, &body, auth, ip).await,
         ("POST", ["api", "tasks"]) => {
             parse_request(&body).map_err(TaskError::Invalid).and_then(|request| manager.add(request)).map(|_| ())
         }
         ("POST", ["api", "tasks", "start-all"]) => manager.start_all(),
         ("POST", ["api", "tasks", "stop-all"]) => manager.stop_all(),
+        ("PUT", ["api", "schedule"]) => serde_json::from_slice(&body)
+            .map_err(|_| "请求内容不是有效的 JSON".to_owned())
+            .and_then(|value| parse_schedule(&value))
+            .map_err(TaskError::Invalid)
+            .and_then(|schedule| manager.set_schedule(schedule)),
         ("PUT", ["api", "tasks", id]) => {
             parse_request(&body).map_err(TaskError::Invalid).and_then(|request| manager.update(id, request))
         }
@@ -180,8 +218,27 @@ async fn handle(request: Request<Incoming>, manager: &Arc<TaskManager>) -> Reply
         _ => return error_reply(StatusCode::NOT_FOUND, "接口不存在"),
     };
     match result {
-        Ok(()) => json_reply(StatusCode::OK, &manager.board()),
+        Ok(()) => board_reply(manager, auth),
         Err(error) => task_error(error),
+    }
+}
+
+async fn login(headers: &HeaderMap, body: &[u8], auth: &Auth, ip: IpAddr) -> Reply {
+    let value: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    let password = value.get("password").and_then(|p| p.as_str()).unwrap_or_default();
+    match auth.login(ip, password) {
+        Login::Ok => {
+            let https = headers.get("x-forwarded-proto").is_some_and(|proto| proto.as_bytes() == b"https");
+            with_cookie(json_reply(StatusCode::OK, &json!({"ok": true})), &auth.session_cookie(https))
+        }
+        Login::Wrong => {
+            eprintln!("登录失败：{ip} 密码错误");
+            tokio::time::sleep(auth.fail_delay).await;
+            error_reply(StatusCode::UNAUTHORIZED, "密码错误")
+        }
+        Login::Locked(minutes) => {
+            error_reply(StatusCode::TOO_MANY_REQUESTS, format!("密码错误次数过多，请 {minutes} 分钟后再试"))
+        }
     }
 }
 
@@ -193,10 +250,14 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn panel() -> (u16, Arc<TaskManager>) {
+        panel_with(Auth::open()).await
+    }
+
+    async fn panel_with(auth: Auth) -> (u16, Arc<TaskManager>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let manager = TaskManager::memory(test_engine());
-        tokio::spawn(serve(listener, manager.clone(), CancellationToken::new()));
+        tokio::spawn(serve(listener, manager.clone(), Arc::new(auth), CancellationToken::new()));
         (port, manager)
     }
 
@@ -255,6 +316,11 @@ mod tests {
         assert_eq!(call(port, "DELETE", "/api/tasks/task-2", &json, "").await.0, 200);
         assert_eq!(call(port, "DELETE", "/api/tasks/task-2", &json, "").await.0, 404);
         assert_eq!(call(port, "POST", "/api/tasks", &json, r#"{"urls":"ftp://x"}"#).await.0, 400);
+        let (status, _, body) = call(port, "PUT", "/api/schedule", &json, r#"{"enabled":true,"hours":[0,1]}"#).await;
+        assert_eq!(status, 200, "{body}");
+        let board: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(board["schedule"], serde_json::json!({"enabled": true, "hours": [0, 1]}));
+        assert_eq!(call(port, "PUT", "/api/schedule", &json, r#"{"enabled":true,"hours":[]}"#).await.0, 400);
 
         let (status, head, exported) = call(port, "GET", "/api/export", &[], "").await;
         assert_eq!(status, 200);
@@ -280,6 +346,57 @@ mod tests {
         let same = [("Origin", origin.as_str()), ("Sec-Fetch-Site", "same-origin")];
         assert_eq!(call(port, "POST", "/api/tasks", &same, body).await.0, 200);
         manager.stop_all().unwrap();
+    }
+
+    #[tokio::test]
+    async fn password_protects_the_panel() {
+        let mut auth = Auth::new("open sesame", &[3; 32]);
+        auth.fail_delay = Duration::ZERO;
+        let (port, manager) = panel_with(auth).await;
+        let json = [("Content-Type", "application/json")];
+        let (status, _, page) = call(port, "GET", "/", &[], "").await;
+        assert!(status == 200 && page.contains("id=\"login\""), "login page not shown");
+        for path in ["/app.js", "/api/state", "/api/export"] {
+            assert_eq!(call(port, "GET", path, &[], "").await.0, 401, "{path}");
+        }
+        for path in ["/style.css", "/favicon.svg", "/healthz"] {
+            assert_eq!(call(port, "GET", path, &[], "").await.0, 200, "{path}");
+        }
+        let body = r#"{"urls":"http://127.0.0.1:9/a"}"#;
+        assert_eq!(call(port, "POST", "/api/tasks", &json, body).await.0, 401);
+        assert_eq!(call(port, "PUT", "/api/schedule", &json, r#"{"enabled":false}"#).await.0, 401);
+        assert_eq!(manager.board().tasks.len(), 0);
+
+        assert_eq!(call(port, "POST", "/api/login", &json, r#"{"password":"nope"}"#).await.0, 401);
+        let (status, head, _) = call(port, "POST", "/api/login", &json, r#"{"password":"open sesame"}"#).await;
+        assert_eq!(status, 200);
+        let cookie = head
+            .lines()
+            .find_map(|line| line.strip_prefix("set-cookie: ").or_else(|| line.strip_prefix("Set-Cookie: ")))
+            .expect("no session cookie")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        assert!(head.contains("HttpOnly; SameSite=Strict"));
+        let signed_in = [("Cookie", cookie.as_str()), ("Content-Type", "application/json")];
+        let (status, _, page) = call(port, "GET", "/", &signed_in, "").await;
+        assert!(status == 200 && page.contains("task-body"));
+        let (status, _, state) = call(port, "GET", "/api/state", &signed_in, "").await;
+        assert_eq!(status, 200);
+        assert_eq!(serde_json::from_str::<Value>(&state).unwrap()["auth"], true);
+        assert_eq!(call(port, "POST", "/api/tasks", &signed_in, body).await.0, 200);
+        let bearer = [("Authorization", "Bearer open sesame")];
+        assert_eq!(call(port, "GET", "/api/state", &bearer, "").await.0, 200);
+        let (_, head, _) = call(port, "POST", "/api/logout", &[], "").await;
+        assert!(head.contains("Max-Age=0"));
+        manager.stop_all().unwrap();
+
+        // Repeated wrong passwords lock the address out, even for the right one.
+        for _ in 0..5 {
+            call(port, "POST", "/api/login", &json, r#"{"password":"guess"}"#).await;
+        }
+        assert_eq!(call(port, "POST", "/api/login", &json, r#"{"password":"open sesame"}"#).await.0, 429);
     }
 
     #[test]

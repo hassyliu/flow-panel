@@ -14,6 +14,8 @@
     <div class="top-right">
       <span id="clock" class="clock" title="定时所用的服务器时间"></span>
       <span id="connection" class="pill">连接中…</span>
+      <span id="no-password" class="pill warn" title="设置环境变量 FLOW_PANEL_PASSWORD 后重启即可启用访问密码" hidden>未设置访问密码</span>
+      <button id="logout" type="button" class="ghost small" hidden>退出</button>
     </div>
   </header>
 
@@ -29,6 +31,11 @@
       <div class="toolbar">
         <input id="search" type="search" placeholder="搜索名称或链接" aria-label="搜索任务">
         <div class="actions">
+          <div class="schedule-ctl" title="没有单独设置时段的任务，按全局定时的时段运行">
+            <label class="switch"><input id="schedule-toggle" type="checkbox"><span class="track"></span>全局定时</label>
+            <button id="schedule-edit" type="button" class="link"></button>
+          </div>
+          <span class="sep"></span>
           <button id="import" type="button" class="ghost">导入</button>
           <button id="export" type="button" class="ghost">导出</button>
           <span class="sep"></span>
@@ -70,16 +77,11 @@
         <label class="check"><input id="task-infinite" type="checkbox" checked> 无限循环，直到手动停止</label>
 
         <details id="hours-section">
-          <summary>运行时段 <small id="hours-summary">全天</small></summary>
-          <label class="check"><input id="hours-limit" type="checkbox"> 只在选中的小时运行 <small id="hours-zone"></small></label>
-          <div id="hours-grid" class="hours" aria-label="选择运行的小时"></div>
-          <div class="presets">
-            <button type="button" data-hours="all">全选</button>
-            <button type="button" data-hours="none">清空</button>
-            <button type="button" data-hours="day">白天 8–23</button>
-            <button type="button" data-hours="night">夜间 0–7</button>
-          </div>
-          <p class="hint">在选中的小时自动开始，其他时间自动暂停；手动停止后不会再被定时启动。</p>
+          <summary>运行时段 <small id="hours-summary">跟随全局定时</small></summary>
+          <label class="check"><input type="radio" name="hours-mode" value="global" checked> 跟随全局定时 <small id="global-note"></small></label>
+          <label class="check"><input type="radio" name="hours-mode" value="custom"> 单独设置这个任务的时段</label>
+          <div id="task-picker" class="picker"></div>
+          <p class="hint">在选中的小时自动开始，其他时间自动暂停；手动停止后不会再被定时启动。按住鼠标拖动可以连续选择。</p>
         </details>
 
         <details id="ip-section">
@@ -109,6 +111,22 @@
     </form>
   </dialog>
 
+  <dialog id="schedule-dialog" aria-labelledby="schedule-title">
+    <form id="schedule-form" method="dialog">
+      <h2 id="schedule-title">全局定时</h2>
+      <fieldset id="schedule-fields">
+        <label class="switch"><input id="schedule-enabled" type="checkbox"><span class="track"></span>开启全局定时 <small id="schedule-zone"></small></label>
+        <div id="schedule-picker" class="picker"></div>
+        <p class="hint">没有单独设置时段的任务按这里的时段运行：到点自动开始，其他时间自动暂停。单独设置了时段的任务不受影响。按住鼠标拖动可以连续选择。</p>
+      </fieldset>
+      <p id="schedule-error" class="error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="cancel ghost">取消</button>
+        <button type="submit" id="schedule-save" class="primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="import-dialog" aria-labelledby="import-title">
     <form id="import-form" method="dialog">
       <h2 id="import-title">导入配置</h2>
@@ -117,7 +135,7 @@
         <input id="import-file" type="file" accept=".json,application/json" required>
         <label class="check"><input type="radio" name="import-mode" value="append" checked> 追加到现有任务</label>
         <label class="check"><input type="radio" name="import-mode" value="replace"> 替换全部任务（需先全部停止）</label>
-        <p class="hint">导入的任务处于停止状态，可点击“全部开始”启动。</p>
+        <p class="hint">导入的任务处于停止状态，可点击“全部开始”启动。选择“替换”时，文件中的全局定时也会一起导入。</p>
       </fieldset>
       <p id="import-error" class="error" role="alert"></p>
       <div class="dialog-actions">

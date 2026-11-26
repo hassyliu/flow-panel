@@ -1,3 +1,4 @@
+mod auth;
 mod config;
 mod engine;
 mod http;
@@ -24,6 +25,7 @@ Flow Panel — 局域网下载任务面板
   --threads <数量>    工作线程数，默认 CPU 核数，最多 4  (FLOW_PANEL_THREADS)
   --ca-file <文件>    额外信任的 CA 证书（PEM）         (FLOW_PANEL_CA_FILE)
   --utc-offset <小时> 定时所用时区，默认 8（北京时间）   (FLOW_PANEL_UTC_OFFSET)
+  --password <密码>   访问密码，不设置则无需登录         (FLOW_PANEL_PASSWORD)
   --healthcheck       检查本机面板是否正常，用于容器健康检查
   --version           显示版本
   --help              显示帮助
@@ -36,6 +38,7 @@ struct Options {
     threads: usize,
     ca_file: Option<PathBuf>,
     utc_offset_minutes: i32,
+    password: Option<String>,
     healthcheck: bool,
 }
 
@@ -53,6 +56,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
     let mut threads = env("FLOW_PANEL_THREADS").unwrap_or_else(|| cores.to_string());
     let mut ca_file = env("FLOW_PANEL_CA_FILE");
     let mut utc_offset = env("FLOW_PANEL_UTC_OFFSET").unwrap_or_else(|| "8".into());
+    let mut password = env("FLOW_PANEL_PASSWORD");
     let mut healthcheck = false;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -68,6 +72,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
             "--threads" => threads = value()?,
             "--ca-file" => ca_file = Some(value()?),
             "--utc-offset" => utc_offset = value()?,
+            "--password" => password = Some(value()?).filter(|p| !p.trim().is_empty()),
             "--healthcheck" => healthcheck = true,
             "--version" | "-V" => return Ok(Command::Print(format!("Flow Panel {}", env!("CARGO_PKG_VERSION")))),
             "--help" | "-h" => return Ok(Command::Print(USAGE.to_owned())),
@@ -91,6 +96,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
         threads,
         ca_file: ca_file.map(PathBuf::from),
         utc_offset_minutes,
+        password,
         healthcheck,
     }))
 }
@@ -139,6 +145,10 @@ async fn run(options: Options) -> Result<(), String> {
     let engine = engine::Engine::new(tls);
     let manager = tasks::TaskManager::load(engine, options.data_dir.join("tasks.json"))?;
     manager.set_utc_offset(options.utc_offset_minutes);
+    let auth = match &options.password {
+        Some(password) => auth::Auth::new(password, &auth::load_secret(&options.data_dir.join("secret.key"))?),
+        None => auth::Auth::open(),
+    };
     let listener = tokio::net::TcpListener::bind((options.host.as_str(), options.port))
         .await
         .map_err(|e| format!("监听 {}:{} 失败：{e}", options.host, options.port))?;
@@ -156,10 +166,15 @@ async fn run(options: Options) -> Result<(), String> {
             "ChaCha20 优先（CPU 无 AES-NI）"
         }
     );
+    if auth.enabled() {
+        println!("访问密码：已开启");
+    } else {
+        println!("警告：未设置访问密码（FLOW_PANEL_PASSWORD），能访问这个端口的人都可以操作面板");
+    }
     manager.resume();
     manager.start_clock();
     let shutdown = CancellationToken::new();
-    let server = tokio::spawn(http::serve(listener, manager.clone(), shutdown.clone()));
+    let server = tokio::spawn(http::serve(listener, manager.clone(), std::sync::Arc::new(auth), shutdown.clone()));
     wait_for_signal().await;
     println!("正在停止…");
     shutdown.cancel();
@@ -237,5 +252,7 @@ mod tests {
         assert!(parse_args(["--utc-offset", "15"].iter().map(|s| s.to_string())).is_err());
         assert!(parse_args(["--bogus"].iter().map(|s| s.to_string())).is_err());
         assert!(parse_args(["--port"].iter().map(|s| s.to_string())).is_err());
+        assert_eq!(options(&["--password", "pw"]).password.as_deref(), Some("pw"));
+        assert_eq!(options(&["--password="]).password, None);
     }
 }

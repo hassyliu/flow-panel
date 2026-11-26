@@ -32,7 +32,9 @@ pub struct Settings {
     pub server_ips: Vec<String>,
     /// Reuse connections between downloads (HTTP keep-alive).
     pub keep_alive: bool,
-    /// Hours of the day (0–23, panel time zone) in which the task runs; empty = all day.
+    /// Hours of the day (0–23, panel time zone) in which the task runs; empty =
+    /// follow the global schedule. All 24 hours runs all day whatever the global
+    /// schedule says.
     pub hours: Vec<u8>,
 }
 
@@ -51,6 +53,38 @@ impl Default for Settings {
             hours: Vec::new(),
         }
     }
+}
+
+/// Run hours shared by every task that has no hours of its own.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Schedule {
+    pub enabled: bool,
+    pub hours: Vec<u8>,
+}
+
+impl Schedule {
+    pub fn allows(&self, hour: u8) -> bool {
+        !self.enabled || self.hours.contains(&hour)
+    }
+}
+
+/// Whether a task with `hours` runs at `hour`, given the global schedule.
+pub fn runs_at(hours: &[u8], global: &Schedule, hour: u8) -> bool {
+    if hours.is_empty() { global.allows(hour) } else { hours.contains(&hour) }
+}
+
+pub fn parse_schedule(value: &Value) -> Result<Schedule, String> {
+    let object = value.as_object().ok_or("全局定时必须是 JSON 对象")?;
+    let enabled = match object.get("enabled") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err("enabled 必须为 true 或 false".into()),
+    };
+    let hours = parse_hours(object.get("hours"))?;
+    if enabled && hours.is_empty() {
+        return Err("开启全局定时时，请至少选择一个小时".into());
+    }
+    Ok(Schedule { enabled, hours })
 }
 
 /// The complete configuration of one task.
@@ -155,7 +189,7 @@ fn parse_settings(object: &Map<String, Value>) -> Result<Settings, String> {
     })
 }
 
-/// Hours 0–23, sorted and deduplicated. All 24 hours is stored as empty (all day).
+/// Hours 0–23, sorted and deduplicated.
 pub fn parse_hours(value: Option<&Value>) -> Result<Vec<u8>, String> {
     const INVALID: &str = "运行时段必须是 0–23 的小时列表";
     let items = match value {
@@ -167,9 +201,6 @@ pub fn parse_hours(value: Option<&Value>) -> Result<Vec<u8>, String> {
     for item in items {
         let hour = item.as_u64().filter(|h| *h < 24).ok_or(INVALID)?;
         hours[hour as usize] = true;
-    }
-    if hours.iter().all(|on| *on) {
-        return Ok(Vec::new());
     }
     Ok((0..24u8).filter(|h| hours[*h as usize]).collect())
 }
@@ -349,13 +380,26 @@ mod tests {
         assert_eq!(parsed.settings.hours, [8, 9, 23]);
         assert!(!parsed.settings.keep_alive);
         let all: Vec<u8> = (0..24).collect();
-        assert!(request(json!({"urls": ["http://a/"], "hours": all})).unwrap().settings.hours.is_empty());
+        assert_eq!(request(json!({"urls": ["http://a/"], "hours": all.clone()})).unwrap().settings.hours, all);
         let defaults = request(json!({"urls": ["http://a/"]})).unwrap().settings;
         assert!(defaults.keep_alive && defaults.hours.is_empty() && defaults.interval == 0.0);
         for bad in [json!([24]), json!([-1]), json!("8-9"), json!([1.5])] {
             assert!(request(json!({"urls": ["http://a/"], "hours": bad})).is_err(), "accepted {bad}");
         }
         assert!(request(json!({"urls": ["http://a/"], "keep_alive": 1})).is_err());
+    }
+
+    #[test]
+    fn global_schedule() {
+        let off = parse_schedule(&json!({"enabled": false, "hours": []})).unwrap();
+        let night = parse_schedule(&json!({"enabled": true, "hours": [0, 1, 1]})).unwrap();
+        assert_eq!(night, Schedule { enabled: true, hours: vec![0, 1] });
+        assert!(parse_schedule(&json!({"enabled": true, "hours": []})).is_err());
+        assert!(parse_schedule(&json!({"enabled": "yes"})).is_err());
+        assert!(parse_schedule(&json!([])).is_err());
+        // A task's own hours win; tasks without hours follow the global schedule.
+        assert!(runs_at(&[], &off, 12) && runs_at(&[], &night, 1) && !runs_at(&[], &night, 12));
+        assert!(runs_at(&[12], &night, 12) && !runs_at(&[12], &off, 1));
     }
 
     #[test]

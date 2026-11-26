@@ -9,10 +9,11 @@ services:
     volumes:
       - flow-panel-data:/data
       # - ./ca.pem:/ca.pem:ro            # 内网私有 CA（可选）
-    # environment:
-    #   FLOW_PANEL_UTC_OFFSET: "8"       # 定时所用时区，默认 8（北京时间）
-    #   FLOW_PANEL_THREADS: "4"          # 工作线程数，默认 CPU 核数（最多 4）
-    #   FLOW_PANEL_CA_FILE: /ca.pem      # 配合上面的 ca.pem 挂载
+    environment:
+      FLOW_PANEL_PASSWORD: "换成你的密码"  # 访问密码，删掉这一行则无需登录
+      # FLOW_PANEL_UTC_OFFSET: "8"       # 定时所用时区，默认 8（北京时间）
+      # FLOW_PANEL_THREADS: "4"          # 工作线程数，默认 CPU 核数（最多 4）
+      # FLOW_PANEL_CA_FILE: /ca.pem      # 配合上面的 ca.pem 挂载
     # mem_limit: 128m
 
 volumes:
