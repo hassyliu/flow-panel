@@ -125,7 +125,7 @@ curl -X POST http://127.0.0.1:8089/api/tasks -H 'Content-Type: application/json'
 
 ## 发布到 Docker Hub
 
-由 GitHub Actions（`.github/workflows/docker.yml`）自动完成：先运行测试，再构建 amd64 + arm64 镜像并推送。
+由 GitHub Actions（`.github/workflows/docker.yml`）自动完成：先运行测试，再构建 amd64（x86-64）镜像并推送。
 
 1. 在 Docker Hub 的 Account settings → Personal access tokens 中，创建一个具有 Read & Write 权限的令牌。
 2. 在 GitHub 仓库的 Settings → Secrets and variables → Actions 中，添加 `DOCKERHUB_USERNAME`（Docker Hub 用户名）和 `DOCKERHUB_TOKEN`（上一步的令牌）。

@@ -1,6 +1,6 @@
 [package]
 name = "flow-panel"
-version = "2.2.0"
+version = "2.2.1"
 edition = "2024"
 description = "LAN download traffic panel with independent tasks"
 publish = false

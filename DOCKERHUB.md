@@ -8,7 +8,7 @@
 - 空闲时内存约 6 MB，256 个并发下载满载时约 15 MB
 - 默认复用连接（Keep-Alive），下载小文件时可省掉大部分 TLS 握手开销
 - CPU 没有 AES-NI 时自动优先协商 ChaCha20
-- 支持 `linux/amd64` 和 `linux/arm64`
+- 镜像为 `linux/amd64`（x86-64），适用于 J1900 等 Intel / AMD 机器
 
 ## 快速开始
 
