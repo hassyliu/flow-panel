@@ -2,15 +2,13 @@
 
 # ---- build: static musl binary ----
 FROM rust:1-alpine AS build
-ARG TARGETPLATFORM
 RUN apk add --no-cache gcc musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY static ./static
-# Separate build caches per architecture so amd64 / arm64 builds never mix.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/src/target,id=flow-panel-target-${TARGETPLATFORM} \
+    --mount=type=cache,target=/src/target,id=flow-panel-target \
     cargo build --release --locked \
  && mkdir -p /out/data \
  && cp target/release/flow-panel /out/flow-panel

@@ -38,16 +38,13 @@ pub fn with_roots(roots: RootCertStore) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
+/// AES-NI with carry-less multiply, which AES-GCM needs to be fast.
 pub fn has_aes_hardware() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         std::arch::is_x86_feature_detected!("aes") && std::arch::is_x86_feature_detected!("pclmulqdq")
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        std::arch::is_aarch64_feature_detected!("aes")
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "x86_64"))]
     {
         false
     }
